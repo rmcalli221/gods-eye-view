@@ -1,3 +1,8 @@
+import {
+  coerceEventCategories,
+  encodeEventCategories,
+} from './eventsFeed.js';
+
 const VALID_DISPOSITIONS = new Set([
   'enabled-only',
   'enabled+options',
@@ -223,6 +228,27 @@ const OPTION_GROUPS = Object.freeze({
     booleanOption('showProjection', 'p', true),
     booleanOption('autoHop', 'a', false),
   ]),
+  events: Object.freeze([
+    Object.freeze({
+      key: 'categories',
+      token: 'c',
+      // Stored as the canonical code string ('cphed'), NOT an id array: the
+      // encoder omits a default-valued option by `===`, and every array is a
+      // fresh reference, so an array-valued default would be written into
+      // every share link forever. `coerceEventCategories` is the one place
+      // that bridges the two representations — the layer speaks id arrays.
+      defaultValue: encodeEventCategories([]),
+      normalize: (value) => {
+        const ids = coerceEventCategories(value);
+        return ids ? encodeEventCategories(ids) : null;
+      },
+      encode: (value) => value,
+      decode: (value) => {
+        const ids = coerceEventCategories(value);
+        return ids ? encodeEventCategories(ids) : null;
+      },
+    }),
+  ]),
   radio: Object.freeze([
     Object.freeze({
       key: 'filter',
@@ -279,6 +305,7 @@ export const LAYER_STATE_REGISTRY = Object.freeze([
   Object.freeze({ id: 'bikeshare', token: 'b', disposition: 'enabled-only' }),
   Object.freeze({ id: 'cctv', token: 'c', disposition: 'enabled+options', optionOwner: 'cctv' }),
   Object.freeze({ id: 'earthquakes', token: 'e', disposition: 'enabled-only' }),
+  Object.freeze({ id: 'events', token: 'n', disposition: 'enabled+options', optionOwner: 'events' }),
   Object.freeze({ id: 'flights', token: 'f', disposition: 'enabled+options', optionOwner: 'flights' }),
   Object.freeze({ id: 'local-dams', token: 'q', disposition: 'enabled-only' }),
   Object.freeze({ id: 'local-datacenters', token: 'd', disposition: 'enabled-only' }),

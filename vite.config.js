@@ -38,8 +38,20 @@ import {
   utcDayKey as tomtomUtcDayKey,
   normalizeBudget as normalizeTomTomBudget,
   isOverBudget as isTomTomOverBudget,
+  // Daily-budget accounting is source-agnostic: the GDELT events proxy reuses
+  // these rather than growing a second copy of the same day-roll logic.
+  utcDayKey as budgetUtcDayKey,
+  normalizeBudget as normalizeDailyBudget,
+  isOverBudget as isOverDailyBudget,
 } from './src/data/tomtomTiles.js';
 import { filterTrailing24h, parseFirmsCsv } from './src/data/firmsCsv.js';
+import {
+  EVENT_CATEGORIES,
+  EVENT_SEVERITY_MODEL,
+  mergeCategoryResults,
+  parseGeoFeatureCollection,
+  scoreCategoryRecords,
+} from './src/data/eventsFeed.js';
 import { fileURLToPath } from 'node:url';
 import { createRequire } from 'node:module';
 import { defineConfig, loadEnv } from 'vite';
@@ -2166,6 +2178,318 @@ function firmsProxy() {
           sendJson(500, { error: 'firms proxy error' });
         }
       });
+    },
+  };
+}
+
+/**
+ * GDELT events tuning. Exported so `src/data/eventsProxy.test.mjs` pins them
+ * without standing up a server.
+ *
+ * The per-category cap is the ONLY point cap that ranks: the merged
+ * `GDELT_DEFAULT_MAX_POINTS` ceiling is a payload-size guard applied after
+ * dedupe. Ranking across categories before the client's filter runs would let
+ * a high-volume feed starve a quiet one — filtering to `disaster` alone must
+ * return disaster's own depth, not whatever survived a global sort.
+ */
+export const GDELT_CATEGORY_MAX_POINTS = 150;
+/** Payload-size ceiling on the merged, deduplicated set. Not a ranking cut. */
+export const GDELT_DEFAULT_MAX_POINTS = 750;
+/** Worst case is 5 categories x 96 refreshes/day = 480; the rest is headroom. */
+export const GDELT_DEFAULT_DAILY_BUDGET = 2000;
+/** GDELT publishes roughly a one-request-per-five-seconds courtesy guidance. */
+export const GDELT_MIN_REQUEST_SPACING_MS = 5_000;
+/** GEO 2.0 timespan window. */
+export const GDELT_DEFAULT_TIMESPAN = '24h';
+
+/**
+ * GDELT GEO 2.0 geolocated-events proxy with a memory + disk cache and a
+ * daily upstream-request budget governor.
+ * Upstream: https://api.gdeltproject.org/api/v2/geo/geo
+ *   ?query={theme query}&format=GeoJSON&mode=PointData&timespan={span}
+ *
+ * KEYLESS — GDELT requires no credential, so unlike firmsProxy there is no
+ * no_key branch and the layer works out of the box. The proxy exists for three
+ * other reasons: to cache (GDELT asks for roughly one request per five
+ * seconds), to bound the daily request count, and to keep raw upstream HTML
+ * out of the browser — GEO 2.0 delivers article links inside
+ * `properties.html`, which src/data/eventsFeed.js unpacks into structured rows
+ * here, server-side.
+ *
+ * Cache/serve-stale shape mirrors firmsProxy; the budget governor mirrors
+ * tomtomProxy (and reuses its budget helpers verbatim). One refresh is five
+ * sequential upstream calls — one per category, never in parallel, spaced by
+ * GDELT_MIN_REQUEST_SPACING_MS — so the 15 min TTL is what keeps that off the
+ * wire. Partial success (≥1 category ok) is cacheable with the failed
+ * categories marked ok:false; total failure throws so the caller serves stale.
+ *
+ * Routes:
+ *   GET /api/events        → {fetchedAt, stale, ttlMs, timespan, categories, count, events}
+ *   GET /api/events/status → {lastFetch, count, stale, ttlMs, budget}
+ *
+ * @returns {import('vite').Plugin}
+ */
+function gdeltEventsProxy() {
+  const TTL_MS = 15 * 60_000;
+  const CACHE_DIR = path.join(process.cwd(), '.gev-cache');
+  const CACHE_PATH = path.join(CACHE_DIR, 'gdelt-events.json');
+  const BUDGET_PATH = path.join(CACHE_DIR, 'gdelt-events-budget.json');
+  const UPSTREAM_TIMEOUT_MS = 20_000;
+  const MAX_RESPONSE_BYTES = 2 * 1024 * 1024;
+
+  /** @type {?{at: number, timespan: string, categories: Array<object>, events: Array<object>}} */
+  let mem = null;
+  let diskChecked = false;
+  /** @type {?Promise<?object>} single-flight refresh */
+  let inflight = null;
+  /** @type {?{date: string, count: number}} */
+  let budget = null;
+  let budgetLoaded = false;
+  let lastUpstreamAt = 0;
+
+  const timespan = () => {
+    const raw = String(process.env.GDELT_EVENTS_TIMESPAN || '').trim();
+    return /^\d{1,3}(min|h|d|w|m)$/.test(raw) ? raw : GDELT_DEFAULT_TIMESPAN;
+  };
+
+  const dailyBudgetLimit = () => {
+    const raw = Number.parseInt(process.env.GDELT_DAILY_REQUEST_BUDGET || '', 10);
+    return Number.isFinite(raw) && raw > 0 ? raw : GDELT_DEFAULT_DAILY_BUDGET;
+  };
+
+  const maxPoints = () => {
+    const raw = Number.parseInt(process.env.GDELT_EVENTS_MAX_POINTS || '', 10);
+    return Number.isFinite(raw) && raw > 0 ? raw : GDELT_DEFAULT_MAX_POINTS;
+  };
+
+  /**
+   * Courtesy spacing between sequential upstream calls. Overridable because
+   * GDELT's published guidance is informal — if the real limit turns out to be
+   * stricter, this moves without a code change (and the offline proxy tests
+   * set it to 0 so a five-category refresh does not take 20 seconds).
+   */
+  const requestSpacingMs = () => {
+    const raw = Number.parseInt(process.env.GDELT_MIN_REQUEST_SPACING_MS || '', 10);
+    return Number.isFinite(raw) && raw >= 0 ? raw : GDELT_MIN_REQUEST_SPACING_MS;
+  };
+
+  async function readDiskOnce() {
+    if (diskChecked) return;
+    diskChecked = true;
+    try {
+      const parsed = JSON.parse(await fsp.readFile(CACHE_PATH, 'utf8'));
+      if (Number.isFinite(parsed?.at) && Array.isArray(parsed?.categories) && Array.isArray(parsed?.events)) {
+        mem = parsed;
+      }
+    } catch { /* no disk cache yet */ }
+  }
+
+  async function writeDisk(entry) {
+    try {
+      await fsp.mkdir(CACHE_DIR, { recursive: true });
+      await fsp.writeFile(CACHE_PATH, JSON.stringify(entry), 'utf8');
+    } catch (err) {
+      console.warn('[gdelt-events-proxy] cache write failed:', err?.message || err);
+    }
+  }
+
+  async function loadBudgetOnce() {
+    if (budgetLoaded) return;
+    budgetLoaded = true;
+    try {
+      const parsed = JSON.parse(await fsp.readFile(BUDGET_PATH, 'utf8'));
+      if (parsed && typeof parsed.date === 'string' && Number.isFinite(parsed.count)) {
+        budget = parsed;
+      }
+    } catch { /* no budget file yet */ }
+  }
+
+  async function persistBudget() {
+    try {
+      await fsp.mkdir(CACHE_DIR, { recursive: true });
+      await fsp.writeFile(BUDGET_PATH, JSON.stringify(budget), 'utf8');
+    } catch (err) {
+      console.warn('[gdelt-events-proxy] budget write failed:', err?.message || err);
+    }
+  }
+
+  /** Roll the counter to today (UTC) and return it. */
+  function currentBudget() {
+    budget = normalizeDailyBudget(budget, budgetUtcDayKey());
+    return budget;
+  }
+
+  /** Count one upstream attempt against today's budget (async persist). */
+  function recordUpstreamFetch() {
+    currentBudget().count += 1;
+    void persistBudget();
+  }
+
+  /**
+   * Fetch and parse one category. Throws on HTTP error, an oversized body, a
+   * non-JSON body, or a payload the parser rejects as non-GeoJSON — GDELT
+   * reports some failures as an HTML page, which must not be cached as "no
+   * events". Never logs the response body.
+   */
+  async function fetchCategory(category, span) {
+    const params = new URLSearchParams({
+      query: category.query,
+      format: 'GeoJSON',
+      mode: 'PointData',
+      timespan: span,
+    });
+    recordUpstreamFetch(); // attempts count — a failed call still hit upstream
+    lastUpstreamAt = Date.now();
+    const res = await fetch(`https://api.gdeltproject.org/api/v2/geo/geo?${params}`, {
+      headers: { 'User-Agent': 'GodsEyeView/0.1 (+https://github.com/bilawalsidhu/gods-eye-view)' },
+      signal: AbortSignal.timeout(UPSTREAM_TIMEOUT_MS),
+    });
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    const body = await readResponseTextCapped(res, MAX_RESPONSE_BYTES);
+    let payload;
+    try {
+      payload = JSON.parse(body);
+    } catch {
+      throw new Error('non-JSON upstream response');
+    }
+    const records = parseGeoFeatureCollection(payload, {
+      category: category.id,
+      maxRecords: GDELT_CATEGORY_MAX_POINTS,
+    });
+    if (records === null) throw new Error('non-GeoJSON upstream payload');
+    return scoreCategoryRecords(records);
+  }
+
+  /**
+   * Refresh every category sequentially, spaced for upstream courtesy. Never
+   * parallel: GDELT publishes a roughly one-request-per-five-seconds guidance
+   * and five simultaneous queries is exactly what that asks callers not to do.
+   */
+  async function refreshUpstream() {
+    const now = Date.now();
+    const span = timespan();
+    const categories = [];
+    const groups = [];
+    for (const category of EVENT_CATEGORIES) {
+      const waitMs = Math.max(0, requestSpacingMs() - (Date.now() - lastUpstreamAt));
+      if (waitMs) await new Promise((resolve) => setTimeout(resolve, waitMs));
+      try {
+        const records = await fetchCategory(category, span);
+        categories.push({ category: category.id, count: records.length, ok: true });
+        groups.push({ category: category.id, records });
+      } catch (err) {
+        console.warn(`[gdelt-events-proxy] ${category.id} fetch failed:`, err?.message || err);
+        categories.push({ category: category.id, count: 0, ok: false });
+      }
+    }
+    if (!categories.some((entry) => entry.ok)) throw new Error('all GDELT categories failed');
+    return {
+      at: now,
+      timespan: span,
+      categories,
+      events: mergeCategoryResults(groups, { maxPoints: maxPoints() }),
+    };
+  }
+
+  /** Cache entry → response payload. */
+  function buildPayload(entry, stale) {
+    return {
+      fetchedAt: entry.at,
+      stale,
+      ttlMs: TTL_MS,
+      timespan: entry.timespan,
+      severityModel: EVENT_SEVERITY_MODEL,
+      categories: entry.categories,
+      count: entry.events.length,
+      events: entry.events,
+    };
+  }
+
+  function install(middlewares) {
+    middlewares.use('/api/events', async (req, res) => {
+      // Sanitized responses only (proxy/security baseline): no upstream error
+      // text and never the upstream URL.
+      const sendJson = (status, obj) => {
+        if (res.headersSent) return;
+        res.writeHead(status, { 'Content-Type': 'application/json', 'Cache-Control': 'no-store' });
+        res.end(JSON.stringify(obj));
+      };
+      try {
+        if (req.method !== 'GET') {
+          sendJson(405, { error: 'method not allowed' });
+          return;
+        }
+        const subPath = String(req.url || '').split('?')[0];
+        await readDiskOnce();
+        await loadBudgetOnce();
+
+        if (subPath === '/status') {
+          const state = currentBudget();
+          sendJson(200, {
+            lastFetch: mem ? mem.at : null,
+            count: mem ? mem.events.length : null,
+            stale: mem ? Date.now() - mem.at >= TTL_MS : false,
+            ttlMs: TTL_MS,
+            timespan: timespan(),
+            severityModel: EVENT_SEVERITY_MODEL,
+            budget: { date: state.date, count: state.count, limit: dailyBudgetLimit() },
+          });
+          return;
+        }
+
+        const entry = mem;
+        if (entry && Date.now() - entry.at < TTL_MS) {
+          sendJson(200, buildPayload(entry, false));
+          return;
+        }
+        // Over the daily soft cap: cache beats a dead layer, and a cold cache
+        // is an honest 429 rather than an unbudgeted upstream pass.
+        if (isOverDailyBudget(currentBudget(), dailyBudgetLimit())) {
+          if (entry) {
+            sendJson(200, buildPayload(entry, true));
+          } else {
+            sendJson(429, { error: 'budget' });
+          }
+          return;
+        }
+        // Stale or missing → refresh, single-flight (concurrent requests share
+        // one upstream pass). Capture the promise locally BEFORE awaiting: the
+        // .finally() nulls `inflight` the moment it settles.
+        if (!inflight) {
+          inflight = refreshUpstream()
+            .then(async (fresh) => {
+              mem = fresh;
+              await writeDisk(fresh);
+              return fresh;
+            })
+            .catch((err) => {
+              console.warn(`[gdelt-events-proxy] refresh failed (${err?.message || err}) — serving cache if any`);
+              return null;
+            })
+            .finally(() => { inflight = null; });
+        }
+        const fresh = await inflight;
+        if (fresh) {
+          sendJson(200, buildPayload(fresh, false));
+        } else if (entry) {
+          sendJson(200, buildPayload(entry, true)); // upstream down — stale beats empty
+        } else {
+          sendJson(502, { error: 'events fetch failed and no cache available' });
+        }
+      } catch (err) {
+        console.warn('[gdelt-events-proxy] error:', err?.message || err);
+        sendJson(500, { error: 'events proxy error' });
+      }
+    });
+  }
+
+  return {
+    name: 'gdelt-events-proxy',
+    configureServer(server) {
+      install(server.middlewares);
+    },
+    configurePreviewServer(server) {
+      install(server.middlewares);
     },
   };
 }
@@ -7345,6 +7669,7 @@ export default defineConfig(({ mode }) => {
       celestrakProxy(),
       tomtomProxy(),
       firmsProxy(),
+      gdeltEventsProxy(),
       rocketLaunchesProxy(),
       terrainHeightsProxy(),
       adsbdbProxy(),
