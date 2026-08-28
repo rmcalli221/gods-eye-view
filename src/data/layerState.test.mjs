@@ -153,10 +153,38 @@ function encode(state) {
   return params.toString();
 }
 
+test('the events category filter round-trips and stays out of a default link', () => {
+  // The durable value is the compact code string, not an id array: an array
+  // default would never compare equal to itself and would be written into
+  // every share link.
+  const state = createDefaultLayerState();
+  state.enabledLayerIds = ['events'];
+  assert.equal(state.options.events.categories, 'cphed', 'all five by default');
+  assert.ok(!encode(state).includes('n.c.'), 'a default filter is omitted');
+
+  state.options.events.categories = 'cd';
+  assert.ok(encode(state).includes('n.c.cd'), 'a narrowed filter is written');
+  const decoded = decodeLayerStateParams(new URLSearchParams(encode(state)));
+  assert.deepEqual(decoded.enabledLayerIds, ['events']);
+  assert.equal(decoded.options.events.categories, 'cd');
+
+  // Order-insensitive on the way in, canonical on the way out.
+  assert.equal(
+    decodeLayerStateParams(new URLSearchParams('v=2&l=n&lo=n.c.dc')).options.events.categories,
+    'cd',
+  );
+  // A malformed or unknown code rejects the ASSIGNMENT (falling back to the
+  // default), matching how every other option token fails closed.
+  for (const bad of ['n.c.z', 'n.c.cc', 'n.c.', 'n.c.cphedx']) {
+    const params = new URLSearchParams(`v=2&l=n&lo=${bad}`);
+    assert.equal(decodeLayerStateParams(params).options.events.categories, 'cphed', bad);
+  }
+});
+
 test('production registry is exact, canonical, and rejects incomplete contracts', async () => {
   assert.equal(validateLayerStateRegistry(), true);
-  assert.equal(REGISTERED_LAYER_IDS.length, 16);
-  assert.equal(new Set(REGISTERED_LAYER_IDS).size, 16);
+  assert.equal(REGISTERED_LAYER_IDS.length, 17);
+  assert.equal(new Set(REGISTERED_LAYER_IDS).size, 17);
   assert.deepEqual(REGISTERED_LAYER_IDS, [...REGISTERED_LAYER_IDS].sort());
   assert.throws(
     () => validateLayerStateRegistry([...LAYER_STATE_REGISTRY, LAYER_STATE_REGISTRY[0]]),

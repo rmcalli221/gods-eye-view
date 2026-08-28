@@ -1,0 +1,23 @@
+{
+  "type": "FeatureCollection",
+  "features": [
+    {
+      "type": "Feature",
+      "geometry": { "type": "Point", "coordinates": [36.2304, 49.9808] },
+      "properties": {
+        "name": "Kharkiv, Kharkivs'ka Oblast', Ukraine",
+        "count": 4,
+        "html": "<b>4 Articles</b><br /><a href=\"https://weather.example/x/1\">Flood warning issued for the river basin</a>"
+      }
+    },
+    {
+      "type": "Feature",
+      "geometry": { "type": "Point", "coordinates": [130.4017, 33.5904] },
+      "properties": {
+        "name": "Fukuoka, Japan",
+        "count": 27,
+        "html": "<b>27 Articles</b><br /><a href=\"https://weather.example/y/2\">Typhoon track shifts toward the coast</a><br /><a href=\"https://relief.example/y/3\">Evacuation centres open across the prefecture</a>"
+      }
+    }
+  ]
+}

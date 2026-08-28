@@ -38,6 +38,7 @@ test('new data proxies install the same routes in dev and preview servers', () =
     'military-installations-proxy',
     'regional-brief-proxy',
     'weather-effects-proxy',
+    'gdelt-events-proxy',
   ]) {
     assert.equal(typeof byName.get(name)?.configureServer, 'function', `${name} dev hook`);
     assert.equal(typeof byName.get(name)?.configurePreviewServer, 'function', `${name} preview hook`);
