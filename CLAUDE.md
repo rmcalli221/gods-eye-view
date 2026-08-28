@@ -32,12 +32,31 @@ Node 24.14.x or 26.x (enforced by `package.json` engines).
 - **No framework.** Vanilla ES modules + CesiumJS + Vite.
 - **UI lives in `src/ui.js`. Layer logic lives in `src/data/<layer>.js`.**
   Never mix them.
-- Each layer is one self-contained module exporting a factory
-  (`createXLayer({ ... })`) returning an object with:
-  `id, name, icon, source, updateInterval` and
-  `init(viewer) / enable(viewer) / disable(viewer) / update(viewer) / destroy()`,
-  plus optional `getStats()` and `getDetectableObjects()`.
-  `src/data/earthquakes.js` is the cleanest reference. Read it before
+- Each layer is one self-contained module in `src/data/` providing a layer
+  object with `id, name, icon, source, updateInterval` and
+  `init(viewer) / enable(viewer) / disable(viewer) / update(viewer)`. Most
+  modules default-export a singleton object literal (flights, cctv, radio,
+  satellites, traffic, ...); a module needing per-instance config exports a
+  factory instead (`createEarthquakesLayer`, `createFirmsHeatmapLayer`,
+  `createLocalGeoJsonLayer`, `createTeleGeographySubmarineCableLayer`) and
+  either default-exports one constructed instance or is constructed in
+  `src/data/localLayers.js`. Register the instance in `src/main.js`.
+- Those four lifecycle methods are REQUIRED — `DataLayerManager` calls them
+  unguarded. Each also receives an options object carrying an `AbortSignal`
+  (`update(viewer, { signal })`); honour it in long fetches, ignore it
+  otherwise. Any of them may be async, and returning `false` rejects the
+  lifecycle transition rather than settling it.
+- **`destroy(viewer)` takes the viewer** — it is what removes the layer's data
+  sources from it. The manager calls it only when present, so it is optional
+  in principle, but every registered layer implements it and one without it
+  leaks its entities on teardown. May be async; `false` rejects teardown.
+- `getStats()` is guarded the same way (absent → `{ count: 0, lastUpdate: null }`)
+  yet every registered layer implements it: it is what feeds the control-chip
+  feed state through `layerFeedState()` in `src/data/manager.js`. Return at
+  least `{ count, lastUpdate, error }`.
+  `getDetectableObjects({ mode, maxCount, seed })` is the genuinely optional
+  one — implement it only for layers whose entities detection should label.
+- `src/data/earthquakes.js` is the cleanest reference. Read it before
   writing a new layer.
 - Register the layer in `LAYER_STATE_REGISTRY` in `src/data/layerState.js`
   as `{ id, token, disposition }`. `token` is one unused letter and owns
