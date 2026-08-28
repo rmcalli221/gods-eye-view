@@ -109,6 +109,14 @@ export const DATA_CREDITS = [
       '(location-matched article links; publisher terms apply)',
   },
   {
+    key: 'gdelt-events',
+    html:
+      'World events (geolocated news clusters): ' +
+      '<a href="https://www.gdeltproject.org/about.html" target="_blank" rel="noopener">GDELT Project</a> ' +
+      'GEO 2.0 &mdash; coverage clusters at place centroids, not verified ' +
+      'incidents; linked articles retain publisher terms',
+  },
+  {
     key: 'austin-cctv',
     html:
       'CCTV cameras &amp; frames: City of Austin, TX — ' +

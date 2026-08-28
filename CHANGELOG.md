@@ -7,6 +7,19 @@ of current runtime behavior, see [`docs/CURRENT-STATE.md`](docs/CURRENT-STATE.md
 
 ### Added
 
+- Added a geolocated World Events layer sourced from GDELT GEO 2.0 (keyless):
+  markers on the globe for conflict, political, humanitarian, economic, and
+  disaster coverage over the trailing 24 hours, with per-category filter chips,
+  a colour legend, and click-through to the source article. Marker size encodes
+  a coverage-intensity index — article volume weighted per category — which is
+  labelled as coverage, not as a severity, casualty, or damage assessment.
+  Coordinates are place centroids GDELT resolved from article text, so the
+  layer feeds no detection surface.
+- Added the `/api/events` dev/preview proxy: five sequential category queries,
+  a 15-minute memory and disk cache, a daily upstream-request budget governor,
+  serve-stale on upstream failure, and sanitized errors. GEO 2.0 article links
+  are extracted from upstream HTML into structured rows server-side, so no
+  upstream markup reaches the browser.
 - Added honest aircraft identity narration: callsign, operator, registration,
   type, and route come only from selected-contact context, and missing operator,
   route, or type enrichment is named explicitly.
