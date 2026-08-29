@@ -10,3 +10,6 @@ output/
 .DS_Store
 .gstack/
 3d-models/
+
+export.zip
+gdelt-sample/
