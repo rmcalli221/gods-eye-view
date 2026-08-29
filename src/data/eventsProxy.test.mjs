@@ -1,15 +1,16 @@
 // src/data/eventsProxy.test.mjs
 // Offline tests for the `/api/events` GDELT proxy. The real middleware is
 // installed into a fake stack and driven with a stubbed `globalThis.fetch`, so
-// cache, budget, stale-serve, and error sanitization are exercised end to end
-// with NO NETWORK. Upstream bodies come from the committed fixtures under
-// src/data/fixtures/ (documented GDELT shape, marked unverified there).
+// the ZIP reader, slice ring, backfill, cache, budget, stale-serve, and error
+// sanitization are all exercised end to end with NO NETWORK. Upstream bodies
+// come from the committed archives under src/data/fixtures/.
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { mkdtempSync, readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import os from 'node:os';
 import path from 'node:path';
+import { deflateRawSync } from 'node:zlib';
 
 // The proxy resolves `.gev-cache/` from process.cwd() when the plugin factory
 // runs. Move to a throwaway directory BEFORE building the config so no test
@@ -20,25 +21,36 @@ process.chdir(mkdtempSync(path.join(os.tmpdir(), 'gev-events-proxy-')));
 
 const createViteConfig = (await import('../../vite.config.js')).default;
 const {
-  GDELT_CATEGORY_MAX_POINTS,
   GDELT_DEFAULT_DAILY_BUDGET,
-  GDELT_DEFAULT_MAX_POINTS,
-  GDELT_DEFAULT_TIMESPAN,
+  GDELT_DEFAULT_MAX_EVENTS,
+  GDELT_EXPORT_BASE,
+  GDELT_MAX_INFLATED_BYTES,
+  GDELT_MAX_ZIP_BYTES,
   GDELT_MIN_REQUEST_SPACING_MS,
+  GDELT_WINDOW_SLICES,
+  readZipEntry,
 } = await import('../../vite.config.js');
 
-const fixture = (name) => readFileSync(path.join(FIXTURES, name), 'utf8');
-const CONFLICT_BODY = fixture('gdelt-geo-conflict-sample.json');
-const DISASTER_BODY = fixture('gdelt-geo-disaster-sample.json');
-const EMPTY_BODY = fixture('gdelt-geo-empty.json');
+const archive = (name) => readFileSync(path.join(FIXTURES, name));
+const SLICE_ZIP = archive('gdelt-export-slice.export.CSV.zip');
+const DATADESC_ZIP = archive('gdelt-export-datadesc.export.CSV.zip');
+const SAMPLE_TSV = readFileSync(path.join(FIXTURES, 'gdelt-export-sample.tsv'), 'utf8');
+
+const NEWEST = '20260829004500';
+const lastUpdateBody = (slice = NEWEST) => [
+  `229194 aaaa ${GDELT_EXPORT_BASE}${slice}.mentions.CSV.zip`,
+  `67421 bbbb ${GDELT_EXPORT_BASE}${slice}.export.CSV.zip`,
+  `1180233 cccc ${GDELT_EXPORT_BASE}${slice}.gkg.csv.zip`,
+].join('\n');
 
 /**
- * Build a fresh, isolated proxy instance with its own cache and budget state.
- *
- * Each instance gets its OWN temp cwd: the plugin resolves `.gev-cache/` once,
- * at creation, so without this a "cold" test would find the disk cache a
- * previous test wrote and never reach upstream at all.
+ * The most recently built proxy, so `afterEach` can settle its background
+ * backfill. A fire-and-forget pass that outlives its test would otherwise keep
+ * fetching after `withUpstream` restored the real `globalThis.fetch` — hitting
+ * the network for real and recording its calls against the NEXT test's stub.
  */
+let liveProxy = null;
+
 function freshProxy() {
   process.chdir(mkdtempSync(path.join(os.tmpdir(), 'gev-events-proxy-')));
   const config = createViteConfig({ mode: 'test' });
@@ -46,6 +58,7 @@ function freshProxy() {
   const handlers = [];
   plugin.configureServer({ middlewares: { use: (route, handler) => handlers.push([route, handler]) } });
   const [route, handler] = handlers[0];
+  liveProxy = plugin;
   return { plugin, route, handler };
 }
 
@@ -66,17 +79,34 @@ function fakeRes() {
   };
 }
 
-const upstreamOk = (body) => ({
+const textOk = (body) => ({
   ok: true,
   status: 200,
   headers: new Headers(),
   text: async () => body,
+  body: null,
+});
+
+const zipOk = (buffer) => ({
+  ok: true,
+  status: 200,
+  headers: new Headers({ 'content-length': String(buffer.byteLength) }),
+  arrayBuffer: async () => buffer.buffer.slice(
+    buffer.byteOffset, buffer.byteOffset + buffer.byteLength,
+  ),
+});
+
+const httpError = (status) => ({
+  ok: false,
+  status,
+  headers: new Headers(),
+  text: async () => 'upstream detail that must never be echoed',
+  arrayBuffer: async () => new ArrayBuffer(0),
 });
 
 /**
  * Stub `globalThis.fetch` for the duration of `run`, recording every upstream
- * URL. `respond` receives the request index and returns a Response double or
- * throws to simulate an upstream failure.
+ * URL. `respond` receives the request index and the URL.
  */
 async function withUpstream(respond, run) {
   const original = globalThis.fetch;
@@ -93,23 +123,34 @@ async function withUpstream(respond, run) {
   }
 }
 
+/** Serve lastupdate.txt plus the newest slice; every other slice 404s. */
+const singleSlice = (index, url) => {
+  if (url.endsWith('lastupdate.txt')) return textOk(lastUpdateBody());
+  if (url.endsWith(`${NEWEST}.export.CSV.zip`)) return zipOk(SLICE_ZIP);
+  return httpError(404);
+};
+
 const get = (handler, url = '/') => {
   const res = fakeRes();
   return handler({ method: 'GET', url }, res).then(() => res);
 };
 
-// Category order matches EVENT_CATEGORIES; index 0 is conflict, 4 is disaster.
-const bodyForIndex = (index) => (index === 0 ? CONFLICT_BODY : index === 4 ? DISASTER_BODY : EMPTY_BODY);
-
 test.before(() => {
-  // Remove the courtesy spacing so a five-category refresh does not take 20 s.
+  // Remove the courtesy spacing so a backfill pass does not take a minute.
   process.env.GDELT_MIN_REQUEST_SPACING_MS = '0';
 });
 
 test.beforeEach(() => {
   delete process.env.GDELT_DAILY_REQUEST_BUDGET;
-  delete process.env.GDELT_EVENTS_TIMESPAN;
   delete process.env.GDELT_EVENTS_MAX_POINTS;
+  // A one-slice ring by default, so no background backfill runs and each test
+  // sees exactly the upstream calls it caused. The ring tests opt in.
+  process.env.GDELT_WINDOW_SLICES = '1';
+  liveProxy = null;
+});
+
+test.afterEach(async () => {
+  await liveProxy?.__testing?.settled();
 });
 
 // ── Wiring ──────────────────────────────────────────────────────────────────
@@ -123,182 +164,286 @@ test('the events proxy installs /api/events on both the dev and preview servers'
   assert.equal(freshProxy().route, '/api/events');
 });
 
-test('point caps rank per category only; the merged cap is a payload guard', () => {
-  // The per-category cap is what preserves depth under a category filter. A
-  // merged cap that ranked across categories would let a high-volume feed
-  // starve a quiet one, so it is deliberately larger and applied after dedupe.
-  assert.equal(GDELT_CATEGORY_MAX_POINTS, 150);
-  assert.equal(GDELT_DEFAULT_MAX_POINTS, 750);
-  assert.ok(GDELT_DEFAULT_MAX_POINTS >= GDELT_CATEGORY_MAX_POINTS * 5);
-  assert.equal(GDELT_DEFAULT_TIMESPAN, '24h');
+test('the tuning constants stay within their stated headroom', () => {
+  assert.equal(GDELT_WINDOW_SLICES, 16, '4 h at 15 min a slice');
+  assert.equal(GDELT_DEFAULT_MAX_EVENTS, 750);
   assert.equal(GDELT_MIN_REQUEST_SPACING_MS, 5_000);
-  // Worst case is 5 categories x 96 refreshes/day = 480.
-  assert.ok(GDELT_DEFAULT_DAILY_BUDGET > 480 * 2);
+  // Steady state is 96 slice fetches a day plus backfill.
+  assert.ok(GDELT_DEFAULT_DAILY_BUDGET > 96 * 2);
+  // A slice is ~67 KB zipped, ~400 KB inflated.
+  assert.ok(GDELT_MAX_ZIP_BYTES > 67_000 * 10);
+  assert.ok(GDELT_MAX_INFLATED_BYTES > 400_000 * 10);
+  assert.ok(GDELT_MAX_INFLATED_BYTES > GDELT_MAX_ZIP_BYTES);
+});
+
+// ── The ZIP reader ──────────────────────────────────────────────────────────
+
+test('the ZIP reader recovers the exact bytes of a standard archive', () => {
+  const text = readZipEntry(SLICE_ZIP).toString('utf8');
+  assert.equal(text, SAMPLE_TSV);
+  assert.equal(text.split('\n').filter(Boolean).length, 209);
+});
+
+// The case the migration plan flagged as the container risk. A streamed writer
+// cannot seek back to fill in the sizes, so it sets general-purpose bit 3 and
+// zeroes them in the local header. A reader that trusts the local header
+// inflates nothing and reports an EMPTY FILE — a silent wrong answer.
+test('the ZIP reader handles the data-descriptor case via the central directory', () => {
+  assert.equal(DATADESC_ZIP.readUInt16LE(6) & 0x08, 0x08, 'fixture really has bit 3 set');
+  assert.equal(DATADESC_ZIP.readUInt32LE(18), 0, 'and a zeroed local-header size');
+
+  const text = readZipEntry(DATADESC_ZIP).toString('utf8');
+  assert.ok(text.length > 0, 'not silently empty');
+  const rows = text.split('\n').filter(Boolean);
+  assert.equal(rows.length, 3);
+  for (const row of rows) assert.equal(row.split('\t').length, 61);
+});
+
+test('the ZIP reader refuses a truncated archive rather than returning partial rows', () => {
+  assert.throws(() => readZipEntry(SLICE_ZIP.subarray(0, 200)), /truncated|central directory/i);
+  assert.throws(() => readZipEntry(Buffer.alloc(10)), /not a zip archive/);
+  assert.throws(() => readZipEntry(Buffer.alloc(200)), /not a zip archive/);
+});
+
+test('the ZIP reader caps inflation rather than trusting the declared size', () => {
+  // Declared size over the cap is refused before any inflate work happens.
+  assert.throws(
+    () => readZipEntry(SLICE_ZIP, { maxInflatedBytes: 1024 }),
+    (err) => err.code === 'RESPONSE_TOO_LARGE',
+  );
+
+  // And a header that LIES about being small cannot exhaust memory: the cap is
+  // enforced on what inflate actually produces, not on what it promised.
+  const bomb = Buffer.alloc(1024 * 1024); // compresses to almost nothing
+  const deflated = deflateRawSync(bomb);
+  const name = Buffer.from('x');
+  const local = Buffer.alloc(30 + name.length);
+  local.writeUInt32LE(0x04034b50, 0);
+  local.writeUInt16LE(0, 6);            // no data descriptor
+  local.writeUInt16LE(8, 8);            // deflate
+  local.writeUInt32LE(deflated.length, 18);
+  local.writeUInt32LE(4096, 22);        // lies: claims 4 KB, really 1 MB
+  local.writeUInt16LE(name.length, 26);
+  name.copy(local, 30);
+  assert.throws(
+    () => readZipEntry(Buffer.concat([local, deflated]), { maxInflatedBytes: 8192 }),
+    /maxOutputLength|too large|buffer/i,
+  );
 });
 
 // ── Happy path ──────────────────────────────────────────────────────────────
 
-test('a cold request fetches every category sequentially and serves merged events', async () => {
+test('a cold request reads lastupdate.txt, then the slice it names', async () => {
   const { handler } = freshProxy();
-  await withUpstream((index) => upstreamOk(bodyForIndex(index)), async (urls) => {
+  await withUpstream(singleSlice, async (urls) => {
     const res = await get(handler);
     assert.equal(res.status, 200);
-    assert.equal(res.headers['Cache-Control'], 'no-store');
-    assert.equal(urls.length, 5, 'one upstream request per category');
-    for (const url of urls) {
-      assert.ok(url.startsWith('https://api.gdeltproject.org/api/v2/geo/geo?'));
-      assert.ok(url.includes('format=GeoJSON'));
-      assert.ok(url.includes('mode=PointData'));
-      assert.ok(url.includes('timespan=24h'));
-    }
+    // The newest slice URL is DISCOVERED, never built from the local clock —
+    // GDELT's publish time drifts and a hand-built "now" URL 404s routinely.
+    assert.ok(urls[0].endsWith('lastupdate.txt'), `first call is the pointer: ${urls[0]}`);
+    assert.ok(urls[1].endsWith(`${NEWEST}.export.CSV.zip`), `then the slice: ${urls[1]}`);
 
-    const payload = res.body;
-    assert.equal(payload.stale, false);
-    assert.equal(payload.severityModel, 'coverage-index');
-    assert.equal(payload.timespan, '24h');
-    assert.equal(payload.categories.length, 5);
-    assert.ok(payload.categories.every((entry) => entry.ok === true));
-    assert.equal(payload.count, payload.events.length);
-    assert.ok(payload.count > 0);
-
-    const kharkiv = payload.events.find((event) => event.id === 'evt:49.981,36.230');
-    assert.deepEqual(kharkiv.categories, ['conflict', 'disaster'], 'cross-category dedupe');
-    assert.ok(kharkiv.byCategory.conflict.articles.length > 0);
+    const body = res.body;
+    assert.equal(body.stale, false);
+    assert.equal(body.sliceCount, 1);
+    assert.equal(body.windowFrom, NEWEST);
+    assert.equal(body.windowTo, NEWEST);
+    assert.ok(body.count > 0);
+    assert.equal(body.count, body.events.length);
+    assert.equal(body.severityModel, 'cameo-intensity');
   });
 });
 
-test('the served payload carries structured article rows and never raw upstream HTML', async () => {
+test('the served window is reduced server-side and reports its funnel', async () => {
   const { handler } = freshProxy();
-  await withUpstream((index) => upstreamOk(bodyForIndex(index)), async () => {
-    const res = await get(handler);
-    const serialized = JSON.stringify(res.body);
-    assert.ok(!serialized.includes('<a href'), 'no anchor markup reaches the client');
-    assert.ok(!serialized.includes('<br'), 'no markup at all');
-    assert.ok(!serialized.includes('shareimage'), 'unused upstream fields are dropped');
-    const [event] = res.body.events;
-    for (const detail of Object.values(event.byCategory)) {
-      for (const article of detail.articles) {
-        assert.ok(article.url.startsWith('https://'));
-        assert.equal(typeof article.title, 'string');
-        assert.equal(typeof article.domain, 'string');
-      }
+  await withUpstream(singleSlice, async () => {
+    const { funnel, events, count } = (await get(handler)).body;
+    // 209 rows in, city-precision only, then deduped by article and place.
+    assert.equal(funnel.total, 209);
+    assert.equal(funnel.no_geo, 10);
+    assert.equal(funnel.low_precision, 75);
+    assert.equal(funnel.retained, 91);
+    assert.equal(count, 91);
+    assert.ok(count <= GDELT_DEFAULT_MAX_EVENTS);
+
+    // Ranked most-severe-first, so a cap keeps the top of the ranking.
+    for (let i = 1; i < events.length; i += 1) {
+      assert.ok(events[i - 1].severity >= events[i].severity);
     }
+    // Every served record is renderable: a coordinate, a category, a source.
+    for (const event of events) {
+      assert.ok(Number.isFinite(event.lat) && Number.isFinite(event.lon));
+      assert.ok(event.category);
+      assert.match(event.url, /^https?:\/\//);
+    }
+  });
+});
+
+test('the payload cap is env-tunable and applied after ranking', async () => {
+  process.env.GDELT_EVENTS_MAX_POINTS = '5';
+  const { handler } = freshProxy();
+  await withUpstream(singleSlice, async () => {
+    const body = (await get(handler)).body;
+    assert.equal(body.count, 5);
+    assert.equal(body.funnel.retained, 91, 'the funnel still reports what was retained');
   });
 });
 
 test('a warm cache serves without touching upstream again', async () => {
   const { handler } = freshProxy();
-  await withUpstream((index) => upstreamOk(bodyForIndex(index)), async (urls) => {
+  await withUpstream(singleSlice, async (urls) => {
     await get(handler);
-    assert.equal(urls.length, 5);
-    const second = await get(handler);
-    assert.equal(second.status, 200);
-    assert.equal(second.body.stale, false);
-    assert.equal(urls.length, 5, 'the second request is a pure cache hit');
+    const before = urls.length;
+    const res = await get(handler);
+    assert.equal(res.status, 200);
+    assert.equal(res.body.stale, false);
+    assert.equal(urls.length, before, 'no further upstream calls');
   });
 });
 
 test('concurrent cold requests share one upstream pass (single-flight)', async () => {
   const { handler } = freshProxy();
-  await withUpstream((index) => upstreamOk(bodyForIndex(index)), async (urls) => {
+  await withUpstream(singleSlice, async (urls) => {
     const [a, b, c] = await Promise.all([get(handler), get(handler), get(handler)]);
-    assert.equal(urls.length, 5, 'three callers, one refresh');
-    for (const res of [a, b, c]) assert.equal(res.status, 200);
-    assert.deepEqual(a.body.events, b.body.events);
+    assert.equal(a.status, 200);
+    assert.equal(b.status, 200);
+    assert.equal(c.status, 200);
+    assert.equal(urls.filter((url) => url.endsWith('lastupdate.txt')).length, 1);
   });
 });
 
-test('the timespan is env-tunable and rejects a malformed value', async () => {
-  process.env.GDELT_EVENTS_TIMESPAN = '3d';
-  await withUpstream((index) => upstreamOk(bodyForIndex(index)), async (urls) => {
-    await get(freshProxy().handler);
-    assert.ok(urls.every((url) => url.includes('timespan=3d')));
+// ── The slice ring ──────────────────────────────────────────────────────────
+
+test('the ring deepens backwards in the background, one slice at a time', async () => {
+  process.env.GDELT_WINDOW_SLICES = '4';
+  const { plugin, handler } = freshProxy();
+  await withUpstream((index, url) => {
+    if (url.endsWith('lastupdate.txt')) return textOk(lastUpdateBody());
+    if (url.endsWith('.export.CSV.zip')) return zipOk(SLICE_ZIP);
+    return httpError(404);
+  }, async () => {
+    const res = await get(handler);
+    // The FIRST response is served from the newest slice alone: a cold start
+    // must not wait out a multi-minute walk backwards.
+    assert.equal(res.body.sliceCount, 1);
+
+    await plugin.__testing.settled();
+    // Backwards from 00:45 in 15-minute steps, to the configured depth.
+    assert.deepEqual(plugin.__testing.sliceKeys(), [
+      '20260829000000', '20260829001500', '20260829003000', '20260829004500',
+    ]);
   });
-  process.env.GDELT_EVENTS_TIMESPAN = 'not a timespan';
-  await withUpstream((index) => upstreamOk(bodyForIndex(index)), async (urls) => {
-    await get(freshProxy().handler);
-    assert.ok(urls.every((url) => url.includes('timespan=24h')), 'falls back to the default');
+});
+
+test('a skipped publish window is a recorded gap, not a stall', async () => {
+  process.env.GDELT_WINDOW_SLICES = '4';
+  const { plugin, handler } = freshProxy();
+  await withUpstream((index, url) => {
+    if (url.endsWith('lastupdate.txt')) return textOk(lastUpdateBody());
+    // GDELT occasionally skips a window; the walk must step past it.
+    if (url.endsWith('20260829003000.export.CSV.zip')) return httpError(404);
+    if (url.endsWith('.export.CSV.zip')) return zipOk(SLICE_ZIP);
+    return httpError(404);
+  }, async () => {
+    await get(handler);
+    await plugin.__testing.settled();
+    assert.deepEqual(plugin.__testing.gaps(), ['20260829003000']);
+    // The walk continued past the hole rather than stopping at it — but it
+    // does NOT reach further back to make up the missing slice. The window is
+    // a span of time, not a quota of files: a quarter hour GDELT never
+    // published has no events, and silently extending into an earlier hour to
+    // fill the count would misreport how much of the window is covered.
+    assert.deepEqual(plugin.__testing.sliceKeys(), [
+      '20260829000000', '20260829001500', '20260829004500',
+    ]);
+  });
+});
+
+test('slices already held are never refetched', async () => {
+  process.env.GDELT_WINDOW_SLICES = '2';
+  const { plugin, handler } = freshProxy();
+  await withUpstream((index, url) => {
+    if (url.endsWith('lastupdate.txt')) return textOk(lastUpdateBody());
+    if (url.endsWith('.export.CSV.zip')) return zipOk(SLICE_ZIP);
+    return httpError(404);
+  }, async (urls) => {
+    await get(handler);
+    await plugin.__testing.settled();
+    const sliceCalls = urls.filter((url) => url.endsWith('.export.CSV.zip'));
+    assert.equal(sliceCalls.length, 2);
+    assert.equal(new Set(sliceCalls).size, 2, 'each slice fetched exactly once');
   });
 });
 
 // ── Failure handling ────────────────────────────────────────────────────────
 
-test('a partial category failure still serves, with the failed categories marked', async () => {
-  const { handler } = freshProxy();
-  await withUpstream((index) => {
-    if (index === 4) throw new Error('upstream exploded with secret detail');
-    return upstreamOk(bodyForIndex(index));
-  }, async () => {
-    const res = await get(handler);
-    assert.equal(res.status, 200, 'one failed category does not fail the request');
-    const failed = res.body.categories.filter((entry) => entry.ok === false);
-    assert.equal(failed.length, 1);
-    assert.equal(failed[0].category, 'disaster');
-    assert.ok(!JSON.stringify(res.body).includes('secret detail'));
-  });
-});
-
 test('a total upstream failure with no cache returns a sanitized 502', async () => {
   const { handler } = freshProxy();
-  await withUpstream(() => { throw new Error('ECONNREFUSED 10.0.0.1:443 internal detail'); }, async () => {
+  await withUpstream(() => httpError(503), async () => {
     const res = await get(handler);
     assert.equal(res.status, 502);
     assert.deepEqual(res.body, { error: 'events fetch failed and no cache available' });
-    assert.ok(!res.raw.includes('ECONNREFUSED'), 'no upstream error text');
-    assert.ok(!res.raw.includes('10.0.0.1'), 'no internal address');
-    assert.ok(!res.raw.includes('gdeltproject'), 'no upstream URL');
+    assert.ok(!res.raw.includes('503'), 'no upstream status leaks');
+    assert.ok(!res.raw.includes('must never be echoed'), 'no upstream body leaks');
+    assert.ok(!res.raw.includes('gdeltproject'), 'no upstream URL leaks');
   });
 });
 
 test('an upstream outage after a good fetch serves the stale cache, not an error', async () => {
   const { handler } = freshProxy();
-  let fresh = null;
-  await withUpstream((index) => upstreamOk(bodyForIndex(index)), async () => {
-    fresh = (await get(handler)).body;
+  await withUpstream(singleSlice, async () => {
+    assert.equal((await get(handler)).status, 200);
   });
-  // Age the cache past its TTL, then break upstream entirely.
+  // Age the cache past its TTL, then take upstream away entirely.
   const realNow = Date.now;
-  Date.now = () => realNow() + 16 * 60_000;
+  Date.now = () => realNow() + 20 * 60_000;
   try {
-    await withUpstream(() => { throw new Error('upstream down'); }, async () => {
+    await withUpstream(() => { throw new Error('connection reset'); }, async () => {
       const res = await get(handler);
       assert.equal(res.status, 200, 'stale beats empty');
-      assert.equal(res.body.stale, true, 'staleness is reported honestly');
-      assert.deepEqual(res.body.events, fresh.events);
+      assert.equal(res.body.stale, true);
+      assert.ok(res.body.count > 0);
     });
   } finally {
     Date.now = realNow;
   }
 });
 
-test('a non-JSON body is an upstream failure, never cached as an empty category', async () => {
+test('a corrupt archive is a failure, never cached as an empty window', async () => {
   const { handler } = freshProxy();
-  await withUpstream(() => upstreamOk('<html><body>GDELT is down</body></html>'), async () => {
+  await withUpstream((index, url) => {
+    if (url.endsWith('lastupdate.txt')) return textOk(lastUpdateBody());
+    return zipOk(Buffer.from('this is not a zip file at all'));
+  }, async () => {
     const res = await get(handler);
-    assert.equal(res.status, 502, 'an HTML error page is not "no events"');
-    assert.ok(!res.raw.includes('<html>'));
+    assert.equal(res.status, 502, 'an unreadable slice is not zero events');
+    assert.ok(!res.raw.includes('zip'), 'no parser detail leaks');
   });
 });
 
-test('a JSON body that is not GeoJSON is also treated as a failure', async () => {
+test('an unusable lastupdate pointer fails rather than guessing a URL', async () => {
   const { handler } = freshProxy();
-  await withUpstream(() => upstreamOk(fixture('gdelt-geo-malformed.json')), async () => {
+  await withUpstream((index, url) => {
+    if (url.endsWith('lastupdate.txt')) return textOk('nothing useful here');
+    return zipOk(SLICE_ZIP);
+  }, async (urls) => {
     assert.equal((await get(handler)).status, 502);
+    assert.equal(urls.filter((url) => url.endsWith('.zip')).length, 0, 'no slice was guessed at');
   });
 });
 
-test('an upstream HTTP error is a category failure with no status leakage', async () => {
+test('an oversized archive is refused before it is inflated', async () => {
   const { handler } = freshProxy();
-  await withUpstream(() => ({
-    ok: false,
-    status: 403,
-    headers: new Headers(),
-    text: async () => 'Forbidden: key xyz',
-  }), async () => {
-    const res = await get(handler);
-    assert.equal(res.status, 502);
-    assert.ok(!res.raw.includes('403'));
-    assert.ok(!res.raw.includes('xyz'));
+  await withUpstream((index, url) => {
+    if (url.endsWith('lastupdate.txt')) return textOk(lastUpdateBody());
+    return {
+      ok: true,
+      status: 200,
+      headers: new Headers({ 'content-length': String(GDELT_MAX_ZIP_BYTES + 1) }),
+      arrayBuffer: async () => { throw new Error('body must not be read'); },
+    };
+  }, async () => {
+    assert.equal((await get(handler)).status, 502);
   });
 });
 
@@ -310,23 +455,21 @@ test('a non-GET request is refused', async () => {
   assert.deepEqual(res.body, { error: 'method not allowed' });
 });
 
-// ── Budget governor ─────────────────────────────────────────────────────────
+// ── Budget ──────────────────────────────────────────────────────────────────
 
-test('an exhausted daily budget returns 429 rather than an unbudgeted fetch', async () => {
-  process.env.GDELT_DAILY_REQUEST_BUDGET = '3';
+test('an exhausted daily budget serves cache rather than an unbudgeted fetch', async () => {
+  process.env.GDELT_DAILY_REQUEST_BUDGET = '2';
   const { handler } = freshProxy();
-  await withUpstream((index) => upstreamOk(bodyForIndex(index)), async (urls) => {
-    // The first refresh spends 5 against a limit of 3 (a soft cap: the pass in
-    // flight is allowed to finish), which puts the next one over.
-    await get(handler);
-    assert.equal(urls.length, 5);
+  await withUpstream(singleSlice, async (urls) => {
+    assert.equal((await get(handler)).status, 200);
+    const spent = urls.length;
     const realNow = Date.now;
-    Date.now = () => realNow() + 16 * 60_000; // expire the cache
+    Date.now = () => realNow() + 20 * 60_000;
     try {
       const res = await get(handler);
-      assert.equal(res.status, 200, 'over budget with a cache serves the cache');
-      assert.equal(res.body.stale, true);
-      assert.equal(urls.length, 5, 'no further upstream requests are issued');
+      assert.equal(res.status, 200);
+      assert.equal(res.body.stale, true, 'cache beats a dead layer');
+      assert.equal(urls.length, spent, 'and no further upstream calls');
     } finally {
       Date.now = realNow;
     }
@@ -336,42 +479,34 @@ test('an exhausted daily budget returns 429 rather than an unbudgeted fetch', as
 test('over budget with no cache at all is an honest 429', async () => {
   process.env.GDELT_DAILY_REQUEST_BUDGET = '1';
   const { handler } = freshProxy();
-  await withUpstream(() => { throw new Error('upstream down'); }, async (urls) => {
-    await get(handler); // spends budget, fails, caches nothing
-    const realNow = Date.now;
-    Date.now = () => realNow() + 16 * 60_000;
-    try {
-      const res = await get(handler);
-      assert.equal(res.status, 429);
-      assert.deepEqual(res.body, { error: 'budget' });
-      assert.equal(urls.length, 5, 'the second request never reaches upstream');
-    } finally {
-      Date.now = realNow;
-    }
+  await withUpstream(() => httpError(500), async () => {
+    await get(handler); // spends the budget and caches nothing
+    const res = await get(handler);
+    assert.equal(res.status, 429);
+    assert.deepEqual(res.body, { error: 'budget' });
   });
 });
 
-// ── Status route ────────────────────────────────────────────────────────────
+// ── Status ──────────────────────────────────────────────────────────────────
 
-test('/status reports cache and budget state without touching upstream', async () => {
+test('/status reports window and budget state without touching upstream', async () => {
   const { handler } = freshProxy();
-  const cold = await get(handler, '/status');
-  assert.equal(cold.status, 200);
-  assert.equal(cold.body.lastFetch, null);
-  assert.equal(cold.body.count, null);
-  assert.equal(cold.body.stale, false);
-  assert.equal(cold.body.ttlMs, 900_000);
-  assert.equal(cold.body.severityModel, 'coverage-index');
-  assert.equal(cold.body.budget.limit, GDELT_DEFAULT_DAILY_BUDGET);
-  assert.equal(cold.body.budget.count, 0);
-  assert.match(cold.body.budget.date, /^\d{4}-\d{2}-\d{2}$/);
-
-  await withUpstream((index) => upstreamOk(bodyForIndex(index)), async (urls) => {
+  await withUpstream(singleSlice, async (urls) => {
     await get(handler);
-    const warm = await get(handler, '/status');
-    assert.ok(Number.isFinite(warm.body.lastFetch));
-    assert.ok(warm.body.count > 0);
-    assert.equal(warm.body.budget.count, 5, 'five upstream attempts counted');
-    assert.equal(urls.length, 5, '/status itself never fetches');
+    const before = urls.length;
+    const res = await get(handler, '/status');
+    assert.equal(res.status, 200);
+    assert.equal(urls.length, before, 'status never fetches');
+
+    const body = res.body;
+    assert.equal(body.stale, false);
+    assert.equal(body.severityModel, 'cameo-intensity');
+    assert.equal(body.windowSlices, 1, 'the depth this test configured');
+    assert.equal(body.sliceCount, 1);
+    assert.equal(body.windowTo, NEWEST);
+    assert.ok(Array.isArray(body.gaps));
+    assert.equal(body.budget.limit, GDELT_DEFAULT_DAILY_BUDGET);
+    assert.ok(body.budget.count > 0, 'attempts are counted');
+    assert.match(body.budget.date, /^\d{4}-\d{2}-\d{2}$/);
   });
 });

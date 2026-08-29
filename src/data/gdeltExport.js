@@ -375,6 +375,9 @@ export function parseExportRow(line, { requirePrecise = true, onReject } = {}) {
     geoPrecision: geoType,
     countryFips: cleanText(fields[COL.ACTION_GEO_COUNTRY_CODE], 8) || null,
     ingestedAt,
+    // The raw YYYYMMDDHHMMSS as served, kept so a caller can derive the slice
+    // key a row belongs to without re-deriving it from epoch ms.
+    rawDateAdded: String(fields[COL.DATE_ADDED] ?? '').trim(),
     eventDate,
     retrospectiveDays,
     rootCode: cleanText(fields[COL.EVENT_ROOT_CODE], 4) || null,

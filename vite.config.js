@@ -30,6 +30,7 @@ import { promises as fsp } from 'node:fs';
 import { createHash, randomUUID } from 'node:crypto';
 import path from 'node:path';
 import { Readable } from 'node:stream';
+import { inflateRawSync } from 'node:zlib';
 import https from 'node:https';
 import { lookup as lookupDns } from 'node:dns/promises';
 import { directionToHeading } from './src/data/directionText.js';
@@ -46,12 +47,16 @@ import {
 } from './src/data/tomtomTiles.js';
 import { filterTrailing24h, parseFirmsCsv } from './src/data/firmsCsv.js';
 import {
-  EVENT_CATEGORIES,
   EVENT_SEVERITY_MODEL,
-  mergeCategoryResults,
-  parseGeoFeatureCollection,
-  scoreCategoryRecords,
+  classifyEventRecords,
 } from './src/data/eventsFeed.js';
+import {
+  exportUrlForSlice,
+  parseExportTsv,
+  parseLastUpdate,
+  previousSliceKey,
+  sliceKeyFromDateAdded,
+} from './src/data/gdeltExport.js';
 import { fileURLToPath } from 'node:url';
 import { createRequire } from 'node:module';
 import { defineConfig, loadEnv } from 'vite';
@@ -2186,46 +2191,151 @@ function firmsProxy() {
  * GDELT events tuning. Exported so `src/data/eventsProxy.test.mjs` pins them
  * without standing up a server.
  *
- * The per-category cap is the ONLY point cap that ranks: the merged
- * `GDELT_DEFAULT_MAX_POINTS` ceiling is a payload-size guard applied after
- * dedupe. Ranking across categories before the client's filter runs would let
- * a high-volume feed starve a quiet one — filtering to `disaster` alone must
- * return disaster's own depth, not whatever survived a global sort.
+ * Steady state is ONE 67 KB fetch per 15-minute window — 96 requests and
+ * ~6.4 MB a day, an order of magnitude less upstream traffic than the five
+ * queries-per-refresh the GEO 2.0 version spent. What is expensive is the cold
+ * start: a full window is `GDELT_WINDOW_SLICES` files, and at the courtesy
+ * spacing below that is minutes of wall clock. Hence serve-newest-immediately
+ * and deepen in the background.
  */
-export const GDELT_CATEGORY_MAX_POINTS = 150;
-/** Payload-size ceiling on the merged, deduplicated set. Not a ranking cut. */
-export const GDELT_DEFAULT_MAX_POINTS = 750;
-/** Worst case is 5 categories x 96 refreshes/day = 480; the rest is headroom. */
+export const GDELT_EXPORT_BASE = 'http://data.gdeltproject.org/gdeltv2/';
+/** Ring depth in 15-minute slices. 16 = 4 h. Env-tunable up to 96 (24 h). */
+export const GDELT_WINDOW_SLICES = 16;
+/** A slice is ~67 KB; this is 30x headroom, not a working figure. */
+export const GDELT_MAX_ZIP_BYTES = 2 * 1024 * 1024;
+/** Zip-bomb guard. A slice inflates to ~400 KB. */
+export const GDELT_MAX_INFLATED_BYTES = 16 * 1024 * 1024;
+/** Payload ceiling on the ranked, deduplicated window. Not a per-category cut. */
+export const GDELT_DEFAULT_MAX_EVENTS = 750;
+/** Steady state is 96 slice fetches/day plus backfill; the rest is headroom. */
 export const GDELT_DEFAULT_DAILY_BUDGET = 2000;
 /** GDELT publishes roughly a one-request-per-five-seconds courtesy guidance. */
 export const GDELT_MIN_REQUEST_SPACING_MS = 5_000;
-/** GEO 2.0 timespan window. */
-export const GDELT_DEFAULT_TIMESPAN = '24h';
+
+/** Local file header signature. */
+const ZIP_LOCAL_SIG = 0x04034b50;
+/** Central directory file header signature. */
+const ZIP_CENTRAL_SIG = 0x02014b50;
+/** End of central directory signature. */
+const ZIP_EOCD_SIG = 0x06054b50;
 
 /**
- * GDELT GEO 2.0 geolocated-events proxy with a memory + disk cache and a
- * daily upstream-request budget governor.
- * Upstream: https://api.gdeltproject.org/api/v2/geo/geo
- *   ?query={theme query}&format=GeoJSON&mode=PointData&timespan={span}
+ * Locate the single entry's sizes in the central directory.
+ *
+ * Needed when the local header cannot be trusted — see `readZipEntry`. The
+ * EOCD record sits at the end of the file but may be followed by a comment of
+ * up to 65,535 bytes, so it is found by scanning backwards for its signature
+ * rather than assumed to be the last 22 bytes.
+ *
+ * @param {Buffer} buf Whole archive.
+ * @returns {{compressedSize: number, uncompressedSize: number, method: number}} Entry sizes.
+ */
+function readZipCentralDirectory(buf) {
+  const EOCD_MIN = 22;
+  const floor = Math.max(0, buf.length - (EOCD_MIN + 0xffff));
+  for (let i = buf.length - EOCD_MIN; i >= floor; i -= 1) {
+    if (buf.readUInt32LE(i) !== ZIP_EOCD_SIG) continue;
+    const cdOffset = buf.readUInt32LE(i + 16);
+    if (cdOffset + 46 > buf.length) break;
+    if (buf.readUInt32LE(cdOffset) !== ZIP_CENTRAL_SIG) break;
+    return {
+      method: buf.readUInt16LE(cdOffset + 10),
+      compressedSize: buf.readUInt32LE(cdOffset + 20),
+      uncompressedSize: buf.readUInt32LE(cdOffset + 24),
+    };
+  }
+  throw new Error('zip central directory not found');
+}
+
+/**
+ * Read the first entry of a single-entry ZIP archive.
+ *
+ * Hand-rolled on `node:zlib` rather than adding a dependency for one call
+ * site, consistent with the repo's minimal-dependency rule. Exported so
+ * `src/data/eventsProxy.test.mjs` can pin it against committed archives.
+ *
+ * THE DATA-DESCRIPTOR CASE IS THE WHOLE REASON THIS IS NOT FIVE LINES. When a
+ * writer streams a ZIP it cannot seek back to fill in the sizes, so it sets
+ * general-purpose bit 3, writes zeroes into the local header, and appends the
+ * real sizes in a descriptor AFTER the payload. A reader that trusts the local
+ * header decompresses zero bytes and reports an empty file — a silent
+ * wrong-answer, not a crash. In that case the sizes come from the central
+ * directory instead.
+ *
+ * Two independent size guards: the declared uncompressed size is rejected
+ * before any work is done, and `maxOutputLength` bounds what inflate will
+ * actually produce, so a header that lies about its size cannot exhaust memory.
+ *
+ * @param {Buffer|ArrayBuffer|Uint8Array} archive Whole archive.
+ * @param {object} [options]
+ * @param {number} [options.maxInflatedBytes=GDELT_MAX_INFLATED_BYTES] Output ceiling.
+ * @returns {Buffer} The entry's decompressed bytes.
+ */
+export function readZipEntry(archive, { maxInflatedBytes = GDELT_MAX_INFLATED_BYTES } = {}) {
+  const buf = Buffer.isBuffer(archive) ? archive : Buffer.from(archive);
+  if (buf.length < 30 || buf.readUInt32LE(0) !== ZIP_LOCAL_SIG) {
+    throw new Error('not a zip archive');
+  }
+  const flags = buf.readUInt16LE(6);
+  const nameLength = buf.readUInt16LE(26);
+  const extraLength = buf.readUInt16LE(28);
+  const dataStart = 30 + nameLength + extraLength;
+  if (dataStart > buf.length) throw new Error('truncated zip local header');
+
+  let method = buf.readUInt16LE(8);
+  let compressedSize = buf.readUInt32LE(18);
+  let uncompressedSize = buf.readUInt32LE(22);
+  // Bit 3 set, or a zero compressed size on a non-empty archive, means the
+  // local header is a placeholder.
+  if ((flags & 0x08) !== 0 || compressedSize === 0) {
+    const central = readZipCentralDirectory(buf);
+    method = central.method;
+    compressedSize = central.compressedSize;
+    uncompressedSize = central.uncompressedSize;
+  }
+  if (uncompressedSize > maxInflatedBytes) {
+    const err = new Error('zip entry declares more than the inflation cap');
+    err.code = 'RESPONSE_TOO_LARGE';
+    throw err;
+  }
+  if (dataStart + compressedSize > buf.length) throw new Error('truncated zip payload');
+
+  const payload = buf.subarray(dataStart, dataStart + compressedSize);
+  if (method === 0) {
+    if (payload.length > maxInflatedBytes) {
+      const err = new Error('stored zip entry exceeds the inflation cap');
+      err.code = 'RESPONSE_TOO_LARGE';
+      throw err;
+    }
+    return Buffer.from(payload);
+  }
+  if (method !== 8) throw new Error(`unsupported zip compression method ${method}`);
+  return inflateRawSync(payload, { maxOutputLength: maxInflatedBytes });
+}
+
+/**
+ * GDELT 2.0 Event Database export proxy: a DATEADDED-keyed ring of 15-minute
+ * slices, with a memory + disk cache and a daily upstream-request budget.
+ *
+ * Upstream: http://data.gdeltproject.org/gdeltv2/{slice}.export.CSV.zip
  *
  * KEYLESS — GDELT requires no credential, so unlike firmsProxy there is no
- * no_key branch and the layer works out of the box. The proxy exists for three
- * other reasons: to cache (GDELT asks for roughly one request per five
- * seconds), to bound the daily request count, and to keep raw upstream HTML
- * out of the browser — GEO 2.0 delivers article links inside
- * `properties.html`, which src/data/eventsFeed.js unpacks into structured rows
- * here, server-side.
+ * no_key branch and the layer works out of the box. The proxy exists to cache,
+ * to bound the daily request count, to do the reduction server-side (a raw
+ * window is tens of thousands of rows against a 300-entity globe budget), and
+ * to keep archive handling out of the browser.
+ *
+ * WHY THIS IS STATEFUL AND THE GEO VERSION WAS NOT: GEO 2.0 answered with a
+ * pre-aggregated 24 h view on every call, so each refresh was self-contained.
+ * The export publishes raw 15-minute slices instead, so the window is
+ * something this proxy accumulates and evicts by `DATEADDED`.
  *
  * Cache/serve-stale shape mirrors firmsProxy; the budget governor mirrors
- * tomtomProxy (and reuses its budget helpers verbatim). One refresh is five
- * sequential upstream calls — one per category, never in parallel, spaced by
- * GDELT_MIN_REQUEST_SPACING_MS — so the 15 min TTL is what keeps that off the
- * wire. Partial success (≥1 category ok) is cacheable with the failed
- * categories marked ok:false; total failure throws so the caller serves stale.
+ * tomtomProxy and reuses its budget helpers verbatim.
  *
  * Routes:
- *   GET /api/events        → {fetchedAt, stale, ttlMs, timespan, categories, count, events}
- *   GET /api/events/status → {lastFetch, count, stale, ttlMs, budget}
+ *   GET /api/events        -> {fetchedAt, stale, ttlMs, window..., funnel, events}
+ *   GET /api/events/status -> {lastFetch, count, stale, ttlMs, window..., budget}
  *
  * @returns {import('vite').Plugin}
  */
@@ -2235,21 +2345,28 @@ function gdeltEventsProxy() {
   const CACHE_PATH = path.join(CACHE_DIR, 'gdelt-events.json');
   const BUDGET_PATH = path.join(CACHE_DIR, 'gdelt-events-budget.json');
   const UPSTREAM_TIMEOUT_MS = 20_000;
-  const MAX_RESPONSE_BYTES = 2 * 1024 * 1024;
 
-  /** @type {?{at: number, timespan: string, categories: Array<object>, events: Array<object>}} */
+  /** Parsed slices, newest-first by key. In memory only — never persisted. */
+  const sliceRing = new Map();
+  /** Slice keys upstream had no file for. Recorded, not retried indefinitely. */
+  const sliceGaps = new Set();
+  /** @type {?object} Built payload, persisted so a restart can serve stale. */
   let mem = null;
   let diskChecked = false;
   /** @type {?Promise<?object>} single-flight refresh */
   let inflight = null;
+  /** @type {?Promise<void>} background ring-deepening pass */
+  let backfilling = null;
   /** @type {?{date: string, count: number}} */
   let budget = null;
   let budgetLoaded = false;
   let lastUpstreamAt = 0;
 
-  const timespan = () => {
-    const raw = String(process.env.GDELT_EVENTS_TIMESPAN || '').trim();
-    return /^\d{1,3}(min|h|d|w|m)$/.test(raw) ? raw : GDELT_DEFAULT_TIMESPAN;
+  const exportBase = () => String(process.env.GDELT_EXPORT_BASE || GDELT_EXPORT_BASE);
+
+  const windowSlices = () => {
+    const raw = Number.parseInt(process.env.GDELT_WINDOW_SLICES || '', 10);
+    return Number.isFinite(raw) && raw > 0 ? Math.min(raw, 96) : GDELT_WINDOW_SLICES;
   };
 
   const dailyBudgetLimit = () => {
@@ -2257,16 +2374,15 @@ function gdeltEventsProxy() {
     return Number.isFinite(raw) && raw > 0 ? raw : GDELT_DEFAULT_DAILY_BUDGET;
   };
 
-  const maxPoints = () => {
+  const maxEvents = () => {
     const raw = Number.parseInt(process.env.GDELT_EVENTS_MAX_POINTS || '', 10);
-    return Number.isFinite(raw) && raw > 0 ? raw : GDELT_DEFAULT_MAX_POINTS;
+    return Number.isFinite(raw) && raw > 0 ? raw : GDELT_DEFAULT_MAX_EVENTS;
   };
 
   /**
    * Courtesy spacing between sequential upstream calls. Overridable because
-   * GDELT's published guidance is informal — if the real limit turns out to be
-   * stricter, this moves without a code change (and the offline proxy tests
-   * set it to 0 so a five-category refresh does not take 20 seconds).
+   * GDELT's published guidance is informal — and the offline proxy tests set it
+   * to 0 so a backfill pass does not take a minute.
    */
   const requestSpacingMs = () => {
     const raw = Number.parseInt(process.env.GDELT_MIN_REQUEST_SPACING_MS || '', 10);
@@ -2278,9 +2394,7 @@ function gdeltEventsProxy() {
     diskChecked = true;
     try {
       const parsed = JSON.parse(await fsp.readFile(CACHE_PATH, 'utf8'));
-      if (Number.isFinite(parsed?.at) && Array.isArray(parsed?.categories) && Array.isArray(parsed?.events)) {
-        mem = parsed;
-      }
+      if (Number.isFinite(parsed?.at) && Array.isArray(parsed?.events)) mem = parsed;
     } catch { /* no disk cache yet */ }
   }
 
@@ -2325,81 +2439,215 @@ function gdeltEventsProxy() {
     void persistBudget();
   }
 
-  /**
-   * Fetch and parse one category. Throws on HTTP error, an oversized body, a
-   * non-JSON body, or a payload the parser rejects as non-GeoJSON — GDELT
-   * reports some failures as an HTML page, which must not be cached as "no
-   * events". Never logs the response body.
-   */
-  async function fetchCategory(category, span) {
-    const params = new URLSearchParams({
-      query: category.query,
-      format: 'GeoJSON',
-      mode: 'PointData',
-      timespan: span,
-    });
+  /** Wait out the courtesy spacing since the last upstream call. */
+  async function spaceUpstream() {
+    const waitMs = Math.max(0, requestSpacingMs() - (Date.now() - lastUpstreamAt));
+    if (waitMs) await new Promise((resolve) => setTimeout(resolve, waitMs));
+  }
+
+  /** One budgeted, spaced, timed-out upstream GET. */
+  async function upstreamFetch(url) {
+    await spaceUpstream();
     recordUpstreamFetch(); // attempts count — a failed call still hit upstream
     lastUpstreamAt = Date.now();
-    const res = await fetch(`https://api.gdeltproject.org/api/v2/geo/geo?${params}`, {
+    return fetch(url, {
       headers: { 'User-Agent': 'GodsEyeView/0.1 (+https://github.com/bilawalsidhu/gods-eye-view)' },
       signal: AbortSignal.timeout(UPSTREAM_TIMEOUT_MS),
     });
-    if (!res.ok) throw new Error(`HTTP ${res.status}`);
-    const body = await readResponseTextCapped(res, MAX_RESPONSE_BYTES);
-    let payload;
-    try {
-      payload = JSON.parse(body);
-    } catch {
-      throw new Error('non-JSON upstream response');
-    }
-    const records = parseGeoFeatureCollection(payload, {
-      category: category.id,
-      maxRecords: GDELT_CATEGORY_MAX_POINTS,
-    });
-    if (records === null) throw new Error('non-GeoJSON upstream payload');
-    return scoreCategoryRecords(records);
   }
 
   /**
-   * Refresh every category sequentially, spaced for upstream courtesy. Never
-   * parallel: GDELT publishes a roughly one-request-per-five-seconds guidance
-   * and five simultaneous queries is exactly what that asks callers not to do.
+   * Fetch, unzip, and parse one slice into the ring.
+   *
+   * A 404 is NOT an error: GDELT occasionally skips a publish window, and a
+   * backfill walking backwards will meet those. The gap is recorded so the
+   * walk moves past it instead of stalling, and so `/status` can show it.
+   *
+   * @param {string} sliceKey Slice to fetch.
+   * @returns {Promise<boolean>} True when a slice was added.
    */
-  async function refreshUpstream() {
-    const now = Date.now();
-    const span = timespan();
-    const categories = [];
-    const groups = [];
-    for (const category of EVENT_CATEGORIES) {
-      const waitMs = Math.max(0, requestSpacingMs() - (Date.now() - lastUpstreamAt));
-      if (waitMs) await new Promise((resolve) => setTimeout(resolve, waitMs));
-      try {
-        const records = await fetchCategory(category, span);
-        categories.push({ category: category.id, count: records.length, ok: true });
-        groups.push({ category: category.id, records });
-      } catch (err) {
-        console.warn(`[gdelt-events-proxy] ${category.id} fetch failed:`, err?.message || err);
-        categories.push({ category: category.id, count: 0, ok: false });
-      }
+  async function fetchSlice(sliceKey) {
+    const url = exportUrlForSlice(sliceKey, exportBase());
+    if (!url) return false;
+    const res = await upstreamFetch(url);
+    if (res.status === 404) {
+      sliceGaps.add(sliceKey);
+      console.warn(`[gdelt-events-proxy] slice ${sliceKey} not published — recorded as a gap`);
+      return false;
     }
-    if (!categories.some((entry) => entry.ok)) throw new Error('all GDELT categories failed');
-    return {
-      at: now,
-      timespan: span,
-      categories,
-      events: mergeCategoryResults(groups, { maxPoints: maxPoints() }),
-    };
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+
+    const declared = Number(res.headers.get('content-length'));
+    if (Number.isFinite(declared) && declared > GDELT_MAX_ZIP_BYTES) {
+      throw new Error('slice archive exceeds the size cap');
+    }
+    const archive = Buffer.from(await res.arrayBuffer());
+    if (archive.byteLength > GDELT_MAX_ZIP_BYTES) {
+      throw new Error('slice archive exceeds the size cap');
+    }
+    const text = readZipEntry(archive).toString('utf8');
+    const { records, rejected, total } = parseExportTsv(text);
+    if (total === 0) throw new Error('slice contained no rows');
+
+    // The ring is keyed by the FILENAME slice, not by the rows' own DATEADDED.
+    // The two agree in practice, but the filename is what `lastupdate.txt`
+    // names and what the backfill walk steps through, so keying on anything
+    // else would make `sliceRing.has()` miss and refetch the same slice
+    // forever. The rows' stamp is kept alongside for the window bounds.
+    sliceRing.set(sliceKey, {
+      key: sliceKey,
+      stamp: sliceKeyFromDateAdded(records[0]?.rawDateAdded) || sliceKey,
+      fetchedAt: Date.now(),
+      records,
+      rejected,
+      total,
+    });
+    sliceGaps.delete(sliceKey);
+    console.log(`[gdelt-events-proxy] slice ${sliceKey}: ${records.length}/${total} rows retained`);
+    return true;
   }
 
-  /** Cache entry → response payload. */
+  /**
+   * Drop slices, and gap markers, that have fallen out of the window.
+   *
+   * Slice keys are fixed-width YYYYMMDDHHMMSS, so lexical order is chronological
+   * order and a sort is enough — no date parsing needed to age the ring out.
+   */
+  function evictOldSlices() {
+    const depth = windowSlices();
+    const keys = [...sliceRing.keys()].sort();
+    const kept = keys.slice(-depth);
+    const keep = new Set(kept);
+    for (const key of keys) if (!keep.has(key)) sliceRing.delete(key);
+    const oldest = kept[0];
+    if (!oldest) return;
+    for (const key of [...sliceGaps]) if (key < oldest) sliceGaps.delete(key);
+  }
+
+  /**
+   * The next older slice worth fetching, or null when the ring is at depth.
+   *
+   * Walks back from the newest held slice, skipping ones already held and ones
+   * already known to be gaps, so a skipped publish window does not stall the
+   * walk forever.
+   *
+   * The walk is bounded by STEPS BACK IN TIME, not by how many slices are
+   * held. The window is a span — the last `depth` quarter hours — so a window
+   * GDELT never published simply has no events in it. Reaching further back to
+   * make the count up would quietly stretch a "last 4 hours" window into a
+   * longer one and misreport how much of it is actually covered.
+   */
+  function nextBackfillSlice() {
+    const keys = [...sliceRing.keys()].sort();
+    if (keys.length === 0) return null;
+    const newest = keys[keys.length - 1];
+    const depth = windowSlices();
+    for (let step = 1; step < depth; step += 1) {
+      const key = previousSliceKey(newest, step);
+      if (!key) break;
+      if (sliceRing.has(key) || sliceGaps.has(key)) continue;
+      return key;
+    }
+    return null;
+  }
+
+  /**
+   * Deepen the ring in the background, one slice at a time.
+   *
+   * Fire-and-forget by design: the first request must not wait out a
+   * multi-minute cold start, so it is served from the newest slice while this
+   * walks backwards behind it. Guarded so only one pass runs at a time.
+   */
+  function startBackfill() {
+    if (backfilling) return backfilling;
+    backfilling = (async () => {
+      for (;;) {
+        if (isOverDailyBudget(currentBudget(), dailyBudgetLimit())) return;
+        const key = nextBackfillSlice();
+        if (!key) return;
+        try {
+          await fetchSlice(key);
+        } catch (err) {
+          console.warn(`[gdelt-events-proxy] backfill ${key} failed:`, err?.message || err);
+          sliceGaps.add(key);
+        }
+        rebuild();
+      }
+    })().catch(() => {}).finally(() => { backfilling = null; });
+    return backfilling;
+  }
+
+  /**
+   * Recompute the served payload from the ring.
+   *
+   * Reduction order is window -> classify (which dedupes across the whole
+   * window) -> rank -> cap. The cap sits above the client's
+   * `EVENTS_MAX_ENTITIES` so the category filter still has depth to choose
+   * from, and it ranks ONE set rather than five: the GEO version needed
+   * per-category ranking because five upstream queries had incomparable
+   * volumes, and one slice stream does not.
+   */
+  function rebuild() {
+    const slices = [...sliceRing.values()].sort((a, b) => a.key.localeCompare(b.key));
+    const raw = [];
+    const funnel = { total: 0, retained: 0 };
+    for (const slice of slices) {
+      raw.push(...slice.records);
+      funnel.total += slice.total;
+      for (const [reason, count] of Object.entries(slice.rejected)) {
+        funnel[reason] = (funnel[reason] || 0) + count;
+      }
+    }
+    const classified = classifyEventRecords(raw);
+    const events = classified.slice(0, maxEvents());
+    funnel.retained = classified.length;
+    mem = {
+      at: Date.now(),
+      windowSlices: windowSlices(),
+      sliceCount: slices.length,
+      windowFrom: slices.length ? slices[0].key : null,
+      windowTo: slices.length ? slices[slices.length - 1].key : null,
+      gaps: [...sliceGaps].sort(),
+      funnel,
+      events,
+    };
+    return mem;
+  }
+
+  /**
+   * Pull the newest published slice, if it is not already held.
+   *
+   * The newest slice URL comes from `lastupdate.txt`, never from the local
+   * clock: GDELT's publish time drifts and a 404 on the current quarter hour is
+   * normal, so a hand-built "now" URL would fail routinely.
+   */
+  async function refreshUpstream() {
+    const res = await upstreamFetch(`${exportBase().replace(/\/*$/, '/')}lastupdate.txt`);
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    const pointer = parseLastUpdate(await readResponseTextCapped(res, 64 * 1024));
+    if (!pointer) throw new Error('unusable lastupdate pointer');
+
+    if (!sliceRing.has(pointer.slice)) {
+      await fetchSlice(pointer.slice);
+      evictOldSlices();
+    }
+    if (sliceRing.size === 0) throw new Error('no slices could be read');
+    return rebuild();
+  }
+
+  /** Cache entry -> response payload. */
   function buildPayload(entry, stale) {
     return {
       fetchedAt: entry.at,
       stale,
       ttlMs: TTL_MS,
-      timespan: entry.timespan,
       severityModel: EVENT_SEVERITY_MODEL,
-      categories: entry.categories,
+      windowSlices: entry.windowSlices,
+      sliceCount: entry.sliceCount,
+      windowFrom: entry.windowFrom,
+      windowTo: entry.windowTo,
+      gaps: entry.gaps,
+      funnel: entry.funnel,
       count: entry.events.length,
       events: entry.events,
     };
@@ -2430,8 +2678,12 @@ function gdeltEventsProxy() {
             count: mem ? mem.events.length : null,
             stale: mem ? Date.now() - mem.at >= TTL_MS : false,
             ttlMs: TTL_MS,
-            timespan: timespan(),
             severityModel: EVENT_SEVERITY_MODEL,
+            windowSlices: windowSlices(),
+            sliceCount: sliceRing.size,
+            windowFrom: mem ? mem.windowFrom : null,
+            windowTo: mem ? mem.windowTo : null,
+            gaps: [...sliceGaps].sort(),
             budget: { date: state.date, count: state.count, limit: dailyBudgetLimit() },
           });
           return;
@@ -2452,13 +2704,12 @@ function gdeltEventsProxy() {
           }
           return;
         }
-        // Stale or missing → refresh, single-flight (concurrent requests share
+        // Stale or missing -> refresh, single-flight (concurrent requests share
         // one upstream pass). Capture the promise locally BEFORE awaiting: the
         // .finally() nulls `inflight` the moment it settles.
         if (!inflight) {
           inflight = refreshUpstream()
             .then(async (fresh) => {
-              mem = fresh;
               await writeDisk(fresh);
               return fresh;
             })
@@ -2470,6 +2721,8 @@ function gdeltEventsProxy() {
         }
         const fresh = await inflight;
         if (fresh) {
+          // Deepen the window behind the response, never in front of it.
+          void startBackfill();
           sendJson(200, buildPayload(fresh, false));
         } else if (entry) {
           sendJson(200, buildPayload(entry, true)); // upstream down — stale beats empty
@@ -2490,6 +2743,16 @@ function gdeltEventsProxy() {
     },
     configurePreviewServer(server) {
       install(server.middlewares);
+    },
+    /**
+     * Test seam. The backfill is deliberately fire-and-forget so a cold request
+     * is not blocked by it, which leaves it otherwise unobservable from a test.
+     * Not used at runtime.
+     */
+    __testing: {
+      settled: () => backfilling || Promise.resolve(),
+      sliceKeys: () => [...sliceRing.keys()].sort(),
+      gaps: () => [...sliceGaps].sort(),
     },
   };
 }
