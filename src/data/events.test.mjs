@@ -1,8 +1,9 @@
 // src/data/events.test.mjs
 // Lifecycle, abort, render-budget, filter, and click-through tests for the
-// GDELT events layer. NO NETWORK: `fetch` is stubbed with payloads assembled
-// from the committed fixtures under src/data/fixtures/ (documented GDELT
-// shape, marked unverified against live data in that directory's README).
+// GDELT CAMEO political-events layer. NO NETWORK: `fetch` is stubbed with
+// payloads assembled from the real export fixture under src/data/fixtures/,
+// pushed through the same parser and classifier the proxy uses — so the record
+// shape under test cannot drift from the one actually served.
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
@@ -20,43 +21,29 @@ import {
   selectEventOverlayCohort,
   shouldOpenEventSource,
 } from './events.js';
-import {
-  mergeCategoryResults,
-  parseGeoFeatureCollection,
-  scoreCategoryRecords,
-} from './eventsFeed.js';
+import { classifyEventRecords } from './eventsFeed.js';
+import { parseExportTsv } from './gdeltExport.js';
 import { registerPickOwner, unregisterPickOwner } from './pickRegistry.js';
 
 const FIXTURES = path.join(path.dirname(fileURLToPath(import.meta.url)), 'fixtures');
-const fixture = (name) => JSON.parse(readFileSync(path.join(FIXTURES, name), 'utf8'));
+const SAMPLE = readFileSync(path.join(FIXTURES, 'gdelt-export-sample.tsv'), 'utf8');
+const FIXTURE_EVENTS = classifyEventRecords(parseExportTsv(SAMPLE).records);
+/** The highest-ranked fixture record — the one a click test can rely on. */
+const TOP_EVENT = FIXTURE_EVENTS[0];
 
-/** Build the `/api/events` payload the proxy would serve, from the fixtures. */
-function proxyPayload({ stale = false, categories = null } = {}) {
-  const groups = [
-    {
-      category: 'conflict',
-      records: scoreCategoryRecords(parseGeoFeatureCollection(
-        fixture('gdelt-geo-conflict-sample.json'), { category: 'conflict' },
-      )),
-    },
-    {
-      category: 'disaster',
-      records: scoreCategoryRecords(parseGeoFeatureCollection(
-        fixture('gdelt-geo-disaster-sample.json'), { category: 'disaster' },
-      )),
-    },
-  ];
-  const events = mergeCategoryResults(groups);
+/** Build the `/api/events` payload the proxy would serve, from the fixture. */
+function proxyPayload({ stale = false, sliceCount = 16, events = FIXTURE_EVENTS } = {}) {
   return {
     fetchedAt: 1_753_600_000_000,
     stale,
     ttlMs: 900_000,
-    timespan: '24h',
-    severityModel: 'coverage-index',
-    categories: categories || [
-      { category: 'conflict', count: 4, ok: true },
-      { category: 'disaster', count: 2, ok: true },
-    ],
+    severityModel: 'cameo-intensity',
+    windowSlices: 16,
+    sliceCount,
+    windowFrom: '20260829004500',
+    windowTo: '20260829004500',
+    gaps: [],
+    funnel: { total: 209, retained: events.length },
     count: events.length,
     events,
   };
@@ -178,11 +165,20 @@ test('analyst record is JSON-safe with nulls instead of NaN or undefined', () =>
     lat: 49.98,
     lon: 36.23,
     severity: 100,
-    count: 42,
-    articles: [{ title: 'Headline', url: 'https://example-news.org/a/1' }],
+    numArticles: 42,
+    url: 'https://example-news.org/a/1',
+    domain: 'example-news.org',
+    rootCode: '19',
+    countryFips: 'UP',
+    retrospectiveDays: 0,
   }, 0);
   assert.equal(record.sourceUrl, 'https://example-news.org/a/1');
-  assert.equal(record.headline, 'Headline');
+  assert.equal(record.sourceDomain, 'example-news.org');
+  assert.equal(record.articleCount, 42);
+  assert.equal(record.rootCode, '19');
+  // FIPS is carried under a name that says so, so nothing downstream reads it
+  // as ISO — UP is Ukraine here, and unassigned in ISO 3166.
+  assert.equal(record.countryFips, 'UP');
   assert.deepEqual(JSON.parse(JSON.stringify(record)), record);
 
   const sparse = mapAnalystRecord({ severity: NaN, lat: undefined }, 7);
@@ -196,11 +192,11 @@ test('analyst record is JSON-safe with nulls instead of NaN or undefined', () =>
 });
 
 test('click-through opens only on a repeat click of the selected record with a URL', () => {
-  const record = { id: 'evt:1', articles: [{ url: 'https://example-news.org/a/1' }] };
+  const record = { id: 'evt:1', url: 'https://example-news.org/a/1' };
   assert.equal(shouldOpenEventSource(null, record), false, 'first click selects');
   assert.equal(shouldOpenEventSource('evt:other', record), false);
   assert.equal(shouldOpenEventSource('evt:1', record), true);
-  assert.equal(shouldOpenEventSource('evt:1', { id: 'evt:1', articles: [] }), false);
+  assert.equal(shouldOpenEventSource('evt:1', { id: 'evt:1' }), false);
   assert.equal(shouldOpenEventSource('evt:1', null), false);
 });
 
@@ -253,6 +249,7 @@ test('lifecycle renders markers, publishes overlay labels, and tears down cleanl
     assert.deepEqual(host.calls.slice(-2), [['clear', 'events'], ['visible', 'events', false]]);
     assert.deepEqual(layer.getStats(), {
       count: 0, lastUpdate: null, error: null, loading: false, stale: false,
+      sliceCount: null, windowSlices: null, partialWindow: false,
     });
   });
 });
@@ -429,27 +426,27 @@ test('a budget 429 and a malformed body get distinct honest error strings', asyn
   });
 });
 
-test('a stale served payload and a partial category failure are both surfaced', async () => {
+test('a stale payload is surfaced, and a still-deepening window is not an error', async () => {
   const viewer = viewerWithSources();
   const layer = createEventsLayer({
     overlayHost: { setEntries() {}, setVisible() {}, clearSource() {} },
     screenSpaceEventHandlerFactory: NOOP_HANDLER_FACTORY,
   });
-  const partial = proxyPayload({
-    stale: true,
-    categories: [
-      { category: 'conflict', count: 4, ok: true },
-      { category: 'disaster', count: 0, ok: false },
-    ],
-  });
+  const partial = proxyPayload({ stale: true, sliceCount: 3 });
   await withFetch(async () => okResponse(partial), async () => {
     layer.init(viewer);
     layer.enable(viewer);
     await layer.update(viewer, {});
     const stats = layer.getStats();
     assert.equal(stats.stale, true, 'a served-stale cache is reported as stale');
-    assert.match(stats.error, /categories unavailable/);
     assert.ok(stats.count > 0, 'stale beats empty — the markers still render');
+    // A window still backfilling is reported as such, NOT as a fetch failure.
+    // The proxy serves the newest slice immediately and deepens behind it, so
+    // a cold start is legitimately thin and a red chip would be a lie.
+    assert.equal(stats.error, null);
+    assert.equal(stats.partialWindow, true);
+    assert.equal(stats.sliceCount, 3);
+    assert.equal(stats.windowSlices, 16);
     layer.destroy(viewer);
   });
 });
@@ -467,8 +464,8 @@ test('the entity budget caps rendered markers at EVENTS_MAX_ENTITIES', async () 
     lat: (index % 80) - 40,
     lon: (index % 170) - 85,
     place: `Place ${index}`,
-    categories: ['conflict'],
-    byCategory: { conflict: { count: index + 1, severity: index % 100, articles: [] } },
+    category: 'conflict',
+    numArticles: index + 1,
     severity: index % 100,
   }));
   await withFetch(async () => okResponse({ ...proxyPayload(), events }), async () => {
@@ -495,17 +492,18 @@ test('setParams filters categories and re-renders without refetching', async () 
     const all = viewer.sources[0].entities.values.length;
     assert.equal(fetchCalls, 1);
 
-    assert.equal(layer.setParams({ categories: ['disaster'] }), true);
-    const disasterOnly = viewer.sources[0].entities.values;
-    assert.ok(disasterOnly.length < all, 'the filter narrows the rendered set');
+    assert.equal(layer.setParams({ categories: ['coercion'] }), true);
+    const coercionOnly = viewer.sources[0].entities.values;
+    assert.ok(coercionOnly.length < all, 'the filter narrows the rendered set');
+    assert.ok(coercionOnly.length > 0, 'and the category is not empty');
     assert.equal(fetchCalls, 1, 'filtering re-renders from cached records');
-    assert.deepEqual(layer.getParams(), { categories: ['disaster'] });
-    for (const entity of disasterOnly) {
-      assert.equal(entity.properties.category.getValue(Cesium.JulianDate.now()), 'disaster');
+    assert.deepEqual(layer.getParams(), { categories: ['coercion'] });
+    for (const entity of coercionOnly) {
+      assert.equal(entity.properties.category.getValue(Cesium.JulianDate.now()), 'coercion');
     }
 
     assert.equal(layer.setParams({ categories: 'conflict' }), false, 'a non-array is rejected');
-    assert.deepEqual(layer.getParams(), { categories: ['disaster'] }, 'a rejected write changes nothing');
+    assert.deepEqual(layer.getParams(), { categories: ['coercion'] }, 'a rejected write changes nothing');
     assert.equal(layer.setParams({}), true, 'an unrelated params write is a no-op');
     layer.destroy(viewer);
   });
@@ -523,11 +521,18 @@ test('row controls expose one chip per category and refuse to disable the last o
     await layer.update(viewer, {});
 
     const all = layer.getRowControls();
-    assert.equal(all.chips.length, 5);
-    assert.ok(all.chips.every((chip) => chip.active));
+    assert.equal(all.chips.length, 5, 'one chip per category');
+    // Four active, not five: diplomacy is roughly 70% of any window and is
+    // deliberately off until asked for.
+    assert.deepEqual(
+      all.chips.filter((chip) => chip.active).map((chip) => chip.id),
+      ['conflict', 'unrest', 'coercion', 'dissent'],
+    );
+    assert.equal(all.chips.find((chip) => chip.id === 'diplomacy').active, false);
     assert.ok(all.chips.every((chip) => !chip.disabled));
-    assert.equal(all.legend.length, 5);
+    assert.equal(all.legend.length, 4, 'the legend shows only active categories');
     assert.ok(all.legend.every((item) => /^#[0-9a-f]{6}$/i.test(item.color)));
+    assert.ok(all.legend.every((item) => item.blurb.length > 0), 'each legend row says what it means');
     assert.ok(all.legend.some((item) => item.count > 0), 'the legend tallies rendered markers');
 
     layer.setParams({ categories: ['conflict'] });
@@ -536,8 +541,8 @@ test('row controls expose one chip per category and refuse to disable the last o
     assert.equal(conflict.active, true);
     assert.equal(conflict.disabled, true, 'the last active chip cannot be turned off');
     assert.equal(single.legend.length, 1);
-    const disaster = single.chips.find((chip) => chip.id === 'disaster');
-    assert.deepEqual(disaster.params.categories.includes('disaster'), true);
+    const diplomacy = single.chips.find((chip) => chip.id === 'diplomacy');
+    assert.deepEqual(diplomacy.params.categories.includes('diplomacy'), true);
     layer.destroy(viewer);
   });
 });
@@ -561,15 +566,15 @@ test('first click selects, second click opens the source, and only then', async 
     assert.ok(clicks.state.action, 'enable installs a LEFT_CLICK handler');
 
     const entity = viewer.sources[0].entities.values
-      .find((candidate) => candidate.id === 'evt:49.981,36.230');
-    assert.ok(entity, 'the Kharkiv marker is rendered');
+      .find((candidate) => candidate.id === TOP_EVENT.id);
+    assert.ok(entity, 'the highest-ranked marker is rendered');
     viewer._setPick({ id: entity });
 
     clicks.state.action({ position: { x: 1, y: 1 } });
     assert.deepEqual(opened, [], 'the first click only selects');
 
     clicks.state.action({ position: { x: 1, y: 1 } });
-    assert.deepEqual(opened, ['https://example-news.org/a/1'], 'the second click opens the source');
+    assert.deepEqual(opened, [TOP_EVENT.url], 'the second click opens the source');
 
     // A click on empty space clears the selection, so the next click on the
     // same marker selects again rather than opening.
@@ -604,7 +609,7 @@ test('a pick owned by another layer is left alone, not treated as empty space', 
       layer.enable(viewer);
       await layer.update(viewer, {});
       const entity = viewer.sources[0].entities.values
-        .find((candidate) => candidate.id === 'evt:49.981,36.230');
+        .find((candidate) => candidate.id === TOP_EVENT.id);
 
       viewer._setPick({ id: entity });
       clicks.state.action({ position: { x: 1, y: 1 } });
@@ -617,7 +622,7 @@ test('a pick owned by another layer is left alone, not treated as empty space', 
       clicks.state.action({ position: { x: 1, y: 1 } });
       assert.deepEqual(
         opened,
-        ['https://example-news.org/a/1'],
+        [TOP_EVENT.url],
         'the selection survived the sibling pick',
       );
       layer.destroy(viewer);
@@ -641,7 +646,7 @@ test('a pick owned by nobody clears the selection like empty space', async () =>
     layer.enable(viewer);
     await layer.update(viewer, {});
     const entity = viewer.sources[0].entities.values
-      .find((candidate) => candidate.id === 'evt:49.981,36.230');
+      .find((candidate) => candidate.id === TOP_EVENT.id);
 
     viewer._setPick({ id: entity });
     clicks.state.action({ position: { x: 1, y: 1 } });
@@ -670,9 +675,10 @@ test('a marker with no article link never opens anything on a repeat click', asy
       lat: 0,
       lon: 0,
       place: 'Nowhere',
-      categories: ['conflict'],
-      byCategory: { conflict: { count: 4, severity: 50, articles: [] } },
+      category: 'conflict',
+      numArticles: 4,
       severity: 50,
+      url: null,
     }],
   };
   await withFetch(async () => okResponse(linkless), async () => {
@@ -696,17 +702,21 @@ test('the layer satisfies the DataLayerManager contract and omits getDetectableO
   assert.equal(layer.id, 'events');
   assert.equal(typeof layer.name, 'string');
   assert.equal(typeof layer.icon, 'string');
-  assert.equal(layer.source, 'GDELT');
+  assert.equal(layer.source, 'GDELT CAMEO');
+  // The display name must not read as a general news feed — the source codes
+  // political interactions and nothing else.
+  assert.equal(layer.name, 'Political Events');
   assert.ok(Number.isFinite(layer.updateInterval) && layer.updateInterval > 0);
   for (const method of ['init', 'enable', 'disable', 'update', 'destroy', 'getStats']) {
     assert.equal(typeof layer[method], 'function', `${method} is required by the manager`);
   }
-  // Deliberately absent: GEO coordinates are place centroids resolved from
+  // Deliberately absent: the coordinates are place centroids resolved from
   // article text, not incident positions. Labelling them as detected objects
   // would present inference as observation. See the module header.
   assert.equal(layer.getDetectableObjects, undefined);
   assert.deepEqual(layer.getStats(), {
     count: 0, lastUpdate: null, error: null, loading: false, stale: false,
+    sliceCount: null, windowSlices: null, partialWindow: false,
   });
 });
 

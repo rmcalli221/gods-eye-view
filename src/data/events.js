@@ -20,7 +20,7 @@ import {
 } from './eventsFeed.js';
 
 /**
- * GDELT geolocated events — trailing 24 h, five categories.
+ * GDELT CAMEO political-interaction events — a rolling window, five categories.
  *
  * Markers are `point` graphics in one `CustomDataSource`, NOT clamped ground
  * ellipses. `src/data/earthquakes.js` documents why in its header: 58
@@ -32,14 +32,21 @@ import {
  * continuous-render hold; the manager's `layer-tick` / `layer-visibility`
  * requests already cover every discrete mutation.
  *
- * WHAT THESE MARKERS ARE: a location GDELT's coverage clustered around, sized
- * by a coverage-intensity index (see `EVENT_SEVERITY_MODEL` in
- * `eventsFeed.js`). They are NOT verified incidents, casualty counts, or
- * damage assessments, and the coordinates are place centroids resolved from
- * article text rather than incident positions. That is also why this layer
- * deliberately implements NO `getDetectableObjects()`: feeding city centroids
- * into panoptic detection would draw target boxes on city centres and label
- * them as detected objects.
+ * WHAT THESE MARKERS ARE: one CAMEO-coded political interaction between two
+ * actors, extracted by GDELT from a news article, plotted at the place the
+ * action was coded to and sized by `EVENT_SEVERITY_MODEL` in `eventsFeed.js`.
+ *
+ * WHAT THEY ARE NOT: verified incidents, casualty counts, or damage
+ * assessments. The coordinates are city centroids resolved from article text,
+ * not incident positions, and the underlying record is an assertion about what
+ * an article said — not a confirmed fact. This layer also covers only what
+ * CAMEO can express: political interactions. It carries no natural disasters
+ * (see the `earthquakes` and FIRMS layers), no humanitarian-need signal, and
+ * no market data, because CAMEO has no codes for any of them.
+ *
+ * That centroid property is also why this layer deliberately implements NO
+ * `getDetectableObjects()`: feeding city centroids into panoptic detection
+ * would draw target boxes on city centres and label them as detected objects.
  */
 
 const API_URL = '/api/events';
@@ -65,7 +72,7 @@ const DEFAULT_OVERLAY_HOST = Object.freeze({
  * @param {Cesium.Cartesian3} input.position Ground anchor shared with the marker.
  * @param {string} input.title Short place label.
  * @param {string} input.accent Source-owned category color.
- * @param {number} input.severity Coverage-intensity index, 0..100.
+ * @param {number} input.severity CAMEO intensity index, 0..100.
  * @returns {object} Overlay entry.
  */
 export function createEventOverlayEntry({ id, position, title, accent, severity }) {
@@ -131,7 +138,7 @@ export function eventLabelText(record) {
 export function shouldOpenEventSource(selectedId, record) {
   if (!record || !selectedId) return false;
   if (selectedId !== record.id) return false;
-  return Boolean(record.articles?.[0]?.url);
+  return Boolean(record.url);
 }
 
 /**
@@ -152,9 +159,15 @@ export function mapAnalystRecord(raw, index = 0) {
     lat: num(raw?.lat),
     lon: num(raw?.lon),
     severity: num(raw?.severity),
-    articleCount: num(raw?.count),
-    sourceUrl: text(raw?.articles?.[0]?.url),
-    headline: text(raw?.articles?.[0]?.title),
+    articleCount: num(raw?.numArticles),
+    sourceUrl: text(raw?.url),
+    sourceDomain: text(raw?.domain),
+    rootCode: text(raw?.rootCode),
+    countryFips: text(raw?.countryFips),
+    // Day the event was coded to happen, which can precede ingest. Exposed as
+    // a distinct field so a query can tell a fresh event from a retrospective
+    // one rather than reading the ingest time as the event time.
+    retrospectiveDays: num(raw?.retrospectiveDays),
   };
 }
 
@@ -178,6 +191,9 @@ export function createEventsLayer({
   let _lastUpdate = null;
   let _lastError = null;
   let _stale = false;
+  /** Slices actually held by the proxy, and the depth it is aiming for. */
+  let _sliceCount = null;
+  let _windowSlices = null;
   let _enabled = false;
   let _loading = false;
   let _abort = null;
@@ -242,9 +258,11 @@ export function createEventsLayer({
         properties: {
           category: record.category,
           severity: record.severity,
-          articleCount: record.count,
+          articleCount: record.numArticles,
           place: record.place,
-          sourceUrl: record.articles?.[0]?.url ?? null,
+          rootCode: record.rootCode,
+          retrospectiveDays: record.retrospectiveDays,
+          sourceUrl: record.url ?? null,
         },
       });
       _renderedById.set(record.id, record);
@@ -301,7 +319,7 @@ export function createEventsLayer({
       // Two-stage: select first, open on a repeat click. See
       // `shouldOpenEventSource`.
       if (shouldOpenEventSource(_selectedId, record)) {
-        openArticle(record.articles[0].url);
+        openArticle(record.url);
         return;
       }
       _selectedId = record.id;
@@ -321,7 +339,10 @@ export function createEventsLayer({
             category: record.categoryLabel,
             severity: record.severity,
             place: record.place,
-            articles: record.articles,
+            sourceUrl: record.url,
+            sourceDomain: record.domain,
+            articleCount: record.numArticles,
+            retrospectiveDays: record.retrospectiveDays,
           });
           selectEntityContext(entity);
         }
@@ -339,9 +360,13 @@ export function createEventsLayer({
 
   const layer = {
     id: 'events',
-    name: 'World Events (24h)',
-    icon: '📰',
-    source: 'GDELT',
+    // Named for what the data actually is. The old "World Events" read as a
+    // general news feed, which oversells a source that codes political
+    // interactions and nothing else. The layer id and its registry token stay
+    // put — they are share-link contract, not display copy.
+    name: 'Political Events',
+    icon: '🏛️',
+    source: 'GDELT CAMEO',
     updateInterval: EVENTS_UPDATE_INTERVAL_MS,
 
     init(viewer) {
@@ -353,6 +378,8 @@ export function createEventsLayer({
       _lastUpdate = null;
       _lastError = null;
       _stale = false;
+      _sliceCount = null;
+      _windowSlices = null;
       _enabled = false;
       _loading = false;
       _selectedId = null;
@@ -436,14 +463,19 @@ export function createEventsLayer({
 
         _records = payload.events;
         _stale = payload.stale === true;
+        _sliceCount = Number.isFinite(payload.sliceCount) ? payload.sliceCount : null;
+        _windowSlices = Number.isFinite(payload.windowSlices) ? payload.windowSlices : null;
         render();
         _lastUpdate = Date.now();
+        // A window still deepening is NOT an error — the proxy serves the
+        // newest slice immediately and backfills behind it, so a cold start is
+        // legitimately thin for a while. Reporting it as a fetch failure would
+        // put a red chip on a layer that is working exactly as designed.
         _lastError = null;
-        const failed = (payload.categories || []).filter((entry) => entry.ok === false);
-        if (failed.length) {
-          _lastError = `${failed.length}/${EVENT_CATEGORIES.length} categories unavailable`;
-        }
-        console.log(`[Data:Events] Updated: ${_count} locations (${EVENT_SEVERITY_MODEL})`);
+        console.log(
+          `[Data:Events] Updated: ${_count} events from ${_sliceCount ?? '?'}/`
+          + `${_windowSlices ?? '?'} slices (${EVENT_SEVERITY_MODEL})`,
+        );
         _rowControlsListener?.();
         return true;
       } catch (e) {
@@ -483,6 +515,8 @@ export function createEventsLayer({
       _lastUpdate = null;
       _lastError = null;
       _stale = false;
+      _sliceCount = null;
+      _windowSlices = null;
     },
 
     /**
@@ -537,7 +571,7 @@ export function createEventsLayer({
             state: isActive ? 'active' : 'idle',
             title: isLastActive
               ? `${entry.label} is the only active category`
-              : `${isActive ? 'Hide' : 'Show'} ${entry.label.toLowerCase()} events`,
+              : `${isActive ? 'Hide' : 'Show'}: ${entry.blurb}`,
             params: { categories: next },
           };
         }),
@@ -547,7 +581,7 @@ export function createEventsLayer({
             label: entry.label,
             color: entry.color,
             count: tally.get(entry.id) || 0,
-            blurb: 'Coverage volume, not a verified incident count',
+            blurb: entry.blurb,
           })),
       };
     },
@@ -581,6 +615,14 @@ export function createEventsLayer({
         error: _lastError,
         loading: _loading,
         stale: _stale,
+        sliceCount: _sliceCount,
+        windowSlices: _windowSlices,
+        // True while the proxy is still backfilling its window. Surfaced so
+        // the chip can say "warming up" rather than looking under-populated
+        // for no stated reason.
+        partialWindow: Number.isFinite(_sliceCount) && Number.isFinite(_windowSlices)
+          ? _sliceCount < _windowSlices
+          : false,
       };
     },
   };
