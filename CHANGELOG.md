@@ -5,21 +5,56 @@ of current runtime behavior, see [`docs/CURRENT-STATE.md`](docs/CURRENT-STATE.md
 
 ## [Unreleased] — 2026-08-24
 
+### Changed
+
+- Moved the events layer off the GDELT GEO 2.0 query API and onto the GDELT 2.0
+  Event Database 15-minute export, and renamed it **World Events → Political
+  Events** to match what the data actually is. GEO 2.0 answered identical
+  requests with 404, an empty 200, or no response at all, non-deterministically,
+  and was unreachable from Node entirely; the export is a static file host and
+  is reachable. The layer now shows CAMEO-coded political interactions between
+  two actors.
+- Replaced the five GKG-theme categories with five CAMEO ones — **conflict,
+  unrest, coercion, dissent, diplomacy** — derived from `EventRootCode` alone
+  and partitioning roots 01–20 exactly. `diplomacy` is off by default at
+  roughly 70% of any window.
+- **Retired the humanitarian, economic, and disaster categories.** CAMEO has no
+  code for any of them, so they cannot be reproduced from this source and are
+  not faked. Natural disasters are already covered, with better data, by the
+  earthquakes (USGS) and FIRMS active-fire layers. `DATA_SOURCES.md` states
+  plainly what this source does and does not cover.
+- Share links issued under the old category grammar still work: the retired
+  codes (`p`, `h`, `e`, `d`) are dropped from an incoming link rather than
+  reused, so an old link loses a category it named instead of silently
+  selecting a different one, and the rest of the link still applies.
+- Marker size now encodes a **CAMEO intensity index** — Goldstein
+  conflict/cooperation scale, article volume, and a per-category weight —
+  replacing the coverage-only index. It is still labelled as an intensity and
+  coverage measure, not a severity, casualty, or damage assessment.
+- Only city-precision events are plotted. Country and state centroids, which
+  the export also carries coordinates for, are dropped rather than drawn as
+  points that would assert a precision the data does not have.
+- `/api/events` keeps a rolling window of 15-minute export slices (default 4 h,
+  `GDELT_WINDOW_SLICES`) instead of issuing five queries per refresh: the
+  newest slice is served immediately and the window is deepened in the
+  background. Steady-state upstream traffic drops to about 96 requests a day.
+  Retires `GDELT_EVENTS_TIMESPAN`; adds `GDELT_WINDOW_SLICES` and
+  `GDELT_EXPORT_BASE`.
+
 ### Added
 
-- Added a geolocated World Events layer sourced from GDELT GEO 2.0 (keyless):
-  markers on the globe for conflict, political, humanitarian, economic, and
-  disaster coverage over the trailing 24 hours, with per-category filter chips,
-  a colour legend, and click-through to the source article. Marker size encodes
-  a coverage-intensity index — article volume weighted per category — which is
-  labelled as coverage, not as a severity, casualty, or damage assessment.
-  Coordinates are place centroids GDELT resolved from article text, so the
-  layer feeds no detection surface.
-- Added the `/api/events` dev/preview proxy: five sequential category queries,
-  a 15-minute memory and disk cache, a daily upstream-request budget governor,
-  serve-stale on upstream failure, and sanitized errors. GEO 2.0 article links
-  are extracted from upstream HTML into structured rows server-side, so no
-  upstream markup reaches the browser.
+- Added a geolocated Political Events layer sourced from the GDELT 2.0 Event
+  Database (keyless): markers on the globe for CAMEO-coded political
+  interactions over a rolling window, with per-category filter chips, a colour
+  legend, and click-through to the source article. Marker size encodes a CAMEO
+  intensity index, labelled as intensity and coverage rather than as a
+  severity, casualty, or damage assessment. Coordinates are city centroids
+  resolved from article text, so the layer feeds no detection surface.
+- Added the `/api/events` dev/preview proxy: a rolling ring of 15-minute export
+  slices, a 15-minute memory and disk cache, a daily upstream-request budget
+  governor, serve-stale on upstream failure, and sanitized errors. Archives are
+  read and the window is reduced server-side, so no archive handling and no
+  unreduced window reaches the browser.
 - Added honest aircraft identity narration: callsign, operator, registration,
   type, and route come only from selected-contact context, and missing operator,
   route, or type enrichment is named explicitly.

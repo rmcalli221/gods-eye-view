@@ -1,6 +1,8 @@
 # Phase 1 decisions — the world-events layer
 
-Status: **decided, not yet implemented.** This file is the durable record of why
+Status: **implemented.** Sections 10-12 record what changed once the plan met
+the data; where they contradict an earlier section, they win. This file is the
+durable record of why
 the events layer moved off the GDELT GEO 2.0 API and onto the GDELT 2.0 Event
 Database export CSV. Read it before touching `src/data/events.js`,
 `src/data/eventsFeed.js`, or the `/api/events` proxy in `vite.config.js`.
@@ -445,7 +447,181 @@ this a formality, but it is a first-party confirmation and it is cheap.
 7. **The proxy becomes stateful**: a `DATEADDED`-keyed ring of 15-minute slices,
    default depth 4 h, served immediately from the newest slice and backfilled in
    the background.
-8. **The five GKG-theme categories do not survive the move.** Resolution is
-   deferred to the migration plan; the recommendation is CAMEO-derived
-   categories with `disaster` delegated to the existing earthquakes/FIRMS
-   layers.
+8. **The five GKG-theme categories do not survive the move.** RESOLVED — see
+   §10. Five CAMEO categories keyed on `EventRootCode` alone: `conflict`
+   (18-20), `unrest` (14), `coercion` (13, 15-17), `dissent` (10-12),
+   `diplomacy` (01-09). `disaster` is delegated to the existing
+   earthquakes/FIRMS layers; `humanitarian` and `economic` are retired with no
+   replacement, because CAMEO has no equivalent.
+9. **`LAYER_STATE_VERSION` stays at 2.** §7 assumed a version bump was the
+   clean way to change the option grammar. It is not: `decodeLayerState`
+   rejects the WHOLE URL on a version mismatch, for every layer at once, so a
+   bump would discard camera, flights and CCTV state to re-grammar one option.
+   Retired category codes are tolerated in place instead.
+
+---
+
+## 10. What the strided fixture changed
+
+§4, §5 and §7 were written against a 50-row `head` of the export. §8 identified
+that sample as systematically unrepresentative; re-sampling with a stride across
+the whole file (209 rows, commit `0cadaf1`) confirmed it, and moved several
+numbers enough to change decisions.
+
+| Measure | head-50 | strided-209 | Consequence |
+| --- | --- | --- | --- |
+| QuadClass 1 (verbal cooperation) | 78% | 63% | The "globe of diplomatic meetings" risk is real but smaller |
+| Root 04 (CONSULT) alone | 44% | 22% | As above |
+| QuadClass 4 (material conflict) | 6% | 17% | Nearly 3x more conflict than assumed |
+| Backdated rows (`SQLDATE` < ingest day) | 30% | 1.4% | The retrospective case is rare, not common |
+| `ActionGeo_Type` 3 or 4 (plottable) | 62% | 59% | Close; the drop rule holds |
+| `ActionGeo_Type` 0 (no geo) | 12% | 5% | Fewer unusable rows |
+
+The backdated figure matters most for how §4 reads. Its core finding is
+unchanged and still correct — `DATEADDED` is the recency field, `SQLDATE` is the
+NLP-extracted date of the event described, and keying the window on `SQLDATE`
+would silently drop fresh news. But the *scale* was overstated: 1.4% of rows are
+backdated, not 30%. The retrospective signal is still carried
+(`retrospectiveDays`) and still worth surfacing; it is an edge case, not a
+visual-design constraint.
+
+### The category mapping in the plan was defective
+
+The migration plan's §3.1 keyed `conflict` on
+`rootCode ∈ {18,19,20} OR quadClass === 4`, with a precedence rule resolving the
+overlap it predicted between `conflict` and `coercion` ("two fixture rows").
+
+Across the strided fixture that overlap is not two rows — it is **all fourteen
+root-17 rows**, and the rule leaves `coercion` matching **nothing at all**. The
+cause is that **QuadClass is a pure coarsening of EventRootCode**:
+
+| QuadClass | Root codes | Distinct quads per root, observed |
+| --- | --- | --- |
+| 1 verbal cooperation | 01-05 | 1 |
+| 2 material cooperation | 06-09 | 1 |
+| 3 verbal conflict | 10-14 | 1 |
+| 4 material conflict | 15-20 | 1 |
+
+No root code maps to two QuadClass values anywhere in the fixture, so QuadClass
+carries no information the root code lacks — and a `quadClass === 4` clause in
+`conflict` silently swallows every coercion root.
+
+**Shipped instead: all five categories keyed on `EventRootCode` alone**, making
+them a total, disjoint partition of 01-20. This is not only non-empty but
+strictly more accurate: under the mixed rule, `15` EXHIBIT FORCE POSTURE and
+`16` REDUCE RELATIONS would both have been labelled armed **conflict**, which a
+military exercise and a severed diplomatic tie are not.
+
+| Precedence | id | code | Roots | strided-209 | plottable |
+| --- | --- | --- | --- | --- | --- |
+| 1 | `conflict` | `c` | 18, 19, 20 | 10.0% | 8.9% |
+| 2 | `unrest` | `u` | 14 | 0.5% | 0.8% |
+| 3 | `coercion` | `x` | 13, 15, 16, 17 | 6.7% | 6.5% |
+| 4 | `dissent` | `s` | 10, 11, 12 | 10.0% | 12.9% |
+| 5 | `diplomacy` | `y` | 01-09 | 72.7% | 71.0% |
+
+The precedence order is retained and the assignment is still a first-match
+walk, but with disjoint buckets it is no longer load-bearing for known codes.
+`eventsFeed.test.mjs` asserts the partition is total and disjoint over 01-20 —
+a stronger guarantee than the tie-break test the plan asked for. An unknown
+root code lands nowhere rather than defaulting into a bucket.
+
+### Share-link codes: retired, not recycled
+
+The plan proposed recycling `d` (disaster) for `dissent` and keeping `p`
+(political/PROTEST) for `diplomacy`. Both would have kept old links parsing
+while changing what they select — a link asking for protests would come back
+selecting diplomatic chatter, which is the "silently mean something different"
+outcome §3.1 itself argued against.
+
+Shipped: only `c` carries over, because only `conflict` kept its meaning. The
+new categories take fresh letters (`u`, `x`, `s`, `y`) and `p`/`h`/`e`/`d` are
+**retired** — dropped from an incoming link, never reused. An old link loses a
+category it named and keeps the rest. A link naming only retired categories
+falls back to the default set rather than blanking the layer.
+
+### Dedupe ranks by severity, not coverage
+
+§5(c) and the plan's §1.3 specified collapsing on `SOURCEURL` + coordinate,
+keeping the row with the highest `numArticles`. Implemented that way, the
+fixture's single protest disappeared: it shares an article and a place with a
+better-covered consultation, and article volume handed the marker to the
+consultation.
+
+One article routinely yields several *different* coded events at one place, so
+the survivor of a collapsed group must be the **most severe** row, with article
+volume breaking severity ties. Dedupe therefore runs after classification, and
+the ranking is injected — `gdeltExport.js` keeps owning record identity,
+`eventsFeed.js` owns what severity means.
+
+## 11. ZIP fixture provenance
+
+`data.gdeltproject.org` is egress-blocked here (HTTP 403), so no archive as
+GDELT serves it could be captured. The two committed archives were built from
+the real TSV with Python's `zipfile` — a **different implementation from the
+reader under test**, so a shared misreading of the format cannot make the tests
+pass — and independently validated with `unzip -t`.
+
+```bash
+python3 - <<'PY'
+import zipfile, io
+data = open('src/data/fixtures/gdelt-export-sample.tsv','rb').read()
+member = '20260829004500.export.CSV'
+
+# Standard: seekable target, so sizes and CRC land in the local header.
+with zipfile.ZipFile('src/data/fixtures/gdelt-export-slice.export.CSV.zip','w',
+                     zipfile.ZIP_DEFLATED, compresslevel=9) as z:
+    z.writestr(member, data)
+
+# Data descriptor: an unseekable stream forces general-purpose bit 3 and
+# zeroes the local-header sizes, moving them to a trailing descriptor.
+class Unseekable(io.RawIOBase):
+    def __init__(self, fh): self.fh = fh
+    def writable(self): return True
+    def write(self, b): return self.fh.write(b)
+    def seekable(self): return False
+    def tell(self): return self.fh.tell()
+
+few = b'\n'.join(data.split(b'\n')[:3]) + b'\n'
+with open('src/data/fixtures/gdelt-export-datadesc.export.CSV.zip','wb') as fh:
+    with zipfile.ZipFile(Unseekable(fh),'w',zipfile.ZIP_DEFLATED, compresslevel=9) as z:
+        z.writestr(member, few)
+PY
+unzip -t src/data/fixtures/gdelt-export-slice.export.CSV.zip
+unzip -t src/data/fixtures/gdelt-export-datadesc.export.CSV.zip
+```
+
+**What a real capture would still add.** These archives prove the reader handles
+both container shapes, but they do not prove GDELT writes either one. If GDELT
+uses Zip64, a non-zero start-disk field, or a multi-entry archive, this reader
+would need changing and these fixtures would not catch it. Capture one where
+the host is reachable:
+
+```bash
+curl -sO http://data.gdeltproject.org/gdeltv2/$(curl -s \
+  http://data.gdeltproject.org/gdeltv2/lastupdate.txt \
+  | awk '/export.CSV.zip/{print $3}' | xargs basename)
+zipinfo -v *.export.CSV.zip | grep -Ei 'entries|zip64|disk|general purpose'
+```
+
+## 12. Residual verification still owed
+
+Two checks could not be performed from this environment.
+
+**1. The first-party column header** (§5, §8). Run where
+`data.gdeltproject.org` is reachable:
+
+```bash
+curl -s http://data.gdeltproject.org/gdeltv2/CSV.header.dailyupdates.txt \
+  | tr '\t' '\n' | nl -ba
+```
+
+Confirm it lists 61 names in the order pinned by `COL` in
+`src/data/gdeltExport.js`, and that entries 52-59 are the `ActionGeo_*` block.
+Two byte-identical independent mirrors plus a clean 61x209 type validation make
+this a formality, but it is first-party and it is cheap.
+
+**2. A real served `.export.CSV.zip`** — see §11.
+
+Neither blocks the implementation. Both would convert a well-evidenced
+inference into a confirmed fact.

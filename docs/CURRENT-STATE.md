@@ -1596,7 +1596,7 @@ its criteria cannot be silently ignored.
 | Live AIS Vessels 🚢 | AISStream websocket | `src/data/aisLiveVessels.js` | `/api/ais-live` | 60s (+800ms visibility pass) |
 | Mapped Installations ⌖ | OpenStreetMap mapped context; on-demand Google Maps Places supplement | `src/data/militaryInstallations.js` | `/api/military-installations`, `/api/google/text-search` | viewport-driven + user search; while unavailable, auto-retry 30 s → 240 s backoff |
 | Earthquakes | USGS | `src/data/earthquakes.js` | — | 60s |
-| World Events 📰 | GDELT GEO 2.0 (keyless; conflict / political / humanitarian / economic / disaster) | `src/data/events.js` (+ pure parser `src/data/eventsFeed.js`) | `/api/events` | 10 min (proxy TTL 15 min) |
+| Political Events 🏛️ | GDELT 2.0 Event Database, CAMEO-coded (keyless; conflict / unrest / coercion / dissent / diplomacy) | `src/data/events.js` (+ pure parser `src/data/gdeltExport.js`, policy `src/data/eventsFeed.js`) | `/api/events` | 10 min (proxy TTL 15 min) |
 | Satellites | CelesTrak | `src/data/satellites.js` | `/api/celestrak` | 120s |
 | Space Missions (30d) | Launch Library 2 + CelesTrak | `src/data/rocketLaunches.js` | `/api/launches` + `/api/celestrak/active` | 5 min |
 | Traffic | OSM Overpass (+ optional TomTom live flow) | `src/data/traffic.js` | `/api/overpass` + `/api/tomtom` | viewport-driven |
@@ -1608,12 +1608,23 @@ its criteria cannot be silently ignored.
 | Submarine Cables ◠ | TeleGeography public map (bundled) | `src/data/telegeographySubmarineCables.js` | — | static |
 | FIRMS Active Fires ▲ | NASA FIRMS live (VIIRS ×3 NRT, trailing 24h) | `src/data/firmsHeatmap.js` | `/api/firms` (`FIRMS_MAP_KEY`) | 10 min (proxy TTL 30 min) |
 
-World Events markers are place centroids GDELT resolved from article text, not
-incident positions, and marker size encodes a coverage-intensity index (article
-volume x a declared per-category weight) rather than a severity, casualty, or
-damage assessment. The layer therefore implements no `getDetectableObjects()`
-and feeds no detection surface. Clicking a marker selects it; clicking the
-selected marker again opens that location's top source article in a new tab.
+Political Events markers are single CAMEO-coded political interactions between
+two actors, plotted at the city centroid the action was coded to — not incident
+positions. Only city-precision rows are plotted; country and state centroids
+are dropped rather than drawn as points. Marker size encodes a CAMEO intensity
+index (Goldstein scale x article volume x a declared per-category weight)
+rather than a severity, casualty, or damage assessment. The layer therefore
+implements no `getDetectableObjects()` and feeds no detection surface. Clicking
+a marker selects it; clicking the selected marker again opens its source
+article in a new tab.
+
+The five categories are derived from CAMEO `EventRootCode` alone and partition
+roots 01-20 exactly: conflict (18-20), unrest (14), coercion (13, 15-17),
+dissent (10-12), diplomacy (01-09). `diplomacy` is off by default — it is
+roughly 70% of any window, and leaving it on buries everything else. What CAMEO
+cannot express, this layer does not carry: there is no natural-disaster,
+humanitarian, or market coverage here. Disasters are the `earthquakes` and
+FIRMS layers' job. See `DATA_SOURCES.md` for the full statement.
 Its five category chips filter the rendered set through `setParams`, and the
 active set is carried in share links under layer token `n`.
 
@@ -2290,7 +2301,7 @@ silently demoting every later lookup for the session.
 - `/api/route` proxies bounded OSRM route requests for annotation routes, with profile allowlisting, distance caps, response caps, caching, and sanitized "no route found" errors.
 - Track endpoints: `/api/ais-live/track?mmsi=` (server-accumulated ring buffers; sub-route handled before the rows snapshot), `/api/opensky-track?icao24=` (OAuth, 60s cache, sanitized errors, independent OpenSky credit bucket), `/api/adsblol/trace?hex=` (60s cache, 5MB cap, ODbL attribution required in UI).
 - Realtime debug logs redact API keys, bearer tokens, client secrets, and image data URLs before writing to disk; request bodies are size-capped.
-- `/api/events` is keyless (GDELT needs no credential) and exists for caching, budget, and sanitization: five sequential category queries spaced for upstream courtesy, 15-minute memory+disk cache, a daily upstream-request soft cap that serves cache or 429 when spent, serve-stale on upstream failure, a 2 MB response cap, and sanitized errors that never echo upstream text, status, or URL. GEO 2.0 article links arrive as an HTML blob and are extracted into structured rows server-side — no upstream markup reaches the browser, and non-`http(s)` schemes are dropped.
+- `/api/events` is keyless (GDELT needs no credential) and exists for caching, budget, reduction, and sanitization. It keeps a `DATEADDED`-keyed ring of GDELT's 15-minute export files (default 4 h, `GDELT_WINDOW_SLICES`, tunable to 24 h): the newest slice URL is read from `lastupdate.txt` — never built from the local clock, because GDELT's publish time drifts and a 404 on the current quarter hour is normal — served immediately, and older slices are walked backwards in the background so a cold start does not block the first request. A 404 on a backfill slice is a recorded gap, not a failure, and the walk is bounded by steps back in time rather than by slices held, so a skipped publish window does not silently stretch the window. Each export is a ZIP read with a hand-rolled `node:zlib` reader that handles the data-descriptor case via the central directory (a reader trusting the local header would report an empty file), with the declared size refused up front and `maxOutputLength` bounding actual inflation. Reduction is server-side — window, drop rules, dedupe, rank, cap — and ranks one set rather than five. Also: 15-minute memory+disk cache, a daily upstream-request soft cap that serves cache or 429 when spent, serve-stale on upstream failure, a 2 MB archive cap, and sanitized errors that never echo upstream text, status, or URL. Non-`http(s)` source links are dropped.
 
 ## UI/UX Runtime Defaults
 

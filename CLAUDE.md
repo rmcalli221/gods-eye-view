@@ -60,8 +60,8 @@ Node 24.14.x or 26.x (enforced by `package.json` engines).
   writing a new layer.
 - Register the layer in `LAYER_STATE_REGISTRY` in `src/data/layerState.js`
   as `{ id, token, disposition }`. `token` is one unused letter and owns
-  URL share-link ordering. Taken: a b c d e f g i m q r s t u w x.
-  Free: h j k l n o p v y z.
+  URL share-link ordering. Taken: a b c d e f g i m n q r s t u w x.
+  Free: h j k l o p v y z.
 - Register attribution in `src/data/dataCredits.js`.
 - Voice tools: declared server-side in `GEV_REALTIME_TOOLS`
   (`vite.config.js`), executed client-side in `src/voice/gevActions.js`.

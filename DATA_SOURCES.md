@@ -31,7 +31,7 @@ How to read this:
 | **Open-Meteo** | Current weather in the cockpit Local Info page and cockpit-local dynamic atmospheric effects | [CC BY 4.0 data licence and adjacent-link attribution requirement](https://open-meteo.com/en/licence) | Linked "Weather data by Open-Meteo.com" beside the displayed local data |
 | **Google News RSS** | Primary locality-matched headlines in the cockpit Regional News page | [Google News Terms of Service](https://www.google.com/intl/en_us/terms_google_news.html) restrict use to personal, noncommercial use; linked articles remain third-party publisher content and retain publisher terms | "Google News RSS" plus each article's linked publisher/domain |
 | **GDELT Project DOC 2.0** | Fail-soft fallback for location-matched cockpit headlines | [GDELT Terms of Use](https://www.gdeltproject.org/about.html#termsofuse): unrestricted academic/commercial/governmental dataset use, with citation and link required; linked articles retain publisher terms | "GDELT Project" plus each article's linked publisher/domain |
-| **GDELT Project GEO 2.0** | Geolocated world-events layer (conflict, political, humanitarian, economic, disaster) | [GDELT Terms of Use](https://www.gdeltproject.org/about.html#termsofuse): unrestricted academic/commercial/governmental dataset use, with citation and link required; linked articles retain publisher terms | "GDELT Project" plus each article's linked publisher/domain |
+| **GDELT Project 2.0 Event Database** | Political Events layer — CAMEO-coded political interactions (conflict, unrest, coercion, dissent, diplomacy) | [GDELT Terms of Use](https://www.gdeltproject.org/about.html#termsofuse): unrestricted academic/commercial/governmental dataset use, with citation and link required; linked articles retain publisher terms | "GDELT Project" plus each article's linked publisher/domain |
 | **City of Austin Open Data** | CCTV camera catalog + frames | City of Austin Open Data Terms of Use | "City of Austin, TX — data.austintexas.gov" |
 | **Caltrans (cwwp2.dot.ca.gov)** | CCTV camera catalogs + frames, California districts | Public Caltrans traffic camera data | "Caltrans — cwwp2.dot.ca.gov" (courtesy) |
 | **TfL Open Data (JamCams)** | CCTV camera catalog + frames, London | [TfL Open Data terms](https://tfl.gov.uk/info-for/open-data-users/) — attribution REQUIRED | "Powered by TfL Open Data. Contains OS data © Crown copyright and database rights" |
@@ -50,28 +50,66 @@ How to read this:
 - **TomTom Traffic.** Optional and BYOK: without `TOMTOM_API_KEY` the traffic layer runs its built-in simulation and no TomTom data (or attribution) appears. With a key, flow vector tiles are fetched through the server-side `/api/tomtom` proxy (120 s cache + a configurable daily tile-budget governor, default 40,000 requests) and the "Traffic flow data © TomTom" credit is registered in the Data attribution popover the moment live mode activates. Set that governor within the current allowance for your TomTom account; the application default is a safety limit, not a promise of free quota. TomTom data is served live and cached only transiently (≤120 s TTL under `.gev-cache/`, gitignored) — it is not bundled or redistributed. One 23 KB point-in-time tile snapshot is committed as a decode-test fixture (`src/data/fixtures/`, © TomTom, never served to the app).
 - **Re:Earth Terrain.** Keyless (no API key). Used two ways: (1) `src/mapStackController.js` swaps in a `Cesium.CesiumTerrainProvider` pointed at Re:Earth's `cesium-mesh/ellipsoid` quantized-mesh endpoint for globe stacks without a Cesium ion token (e.g. OSM), replacing a flat `EllipsoidTerrainProvider`; falls back to the flat provider if the endpoint can't be reached. (2) The server-side `/api/terrain/heights` proxy (disk-cached, serve-stale) resolves per-point ellipsoidal ground height for entity placement. Both are best-effort with a keyless-safe fallback (bundled EGM96 geoid math) if Re:Earth is unreachable.
 - **Global Context installation context.** `/api/military-installations` queries only an allow-listed subset of OSM `military=*` and `landuse=military` features inside a maximum 10° non-dateline viewport. It caches and may serve stale mapped context, but it is neither a global installation database nor evidence of capability, activity, or absence. User-requested Google Places results remain separately sourced candidates unless their returned types explicitly establish military classification; generic offices, museums, and similarly ambiguous matches are excluded from military proximity counts.
-- **World events layer (GDELT GEO 2.0).** `/api/events` issues five keyless
-  GEO 2.0 queries — one per category — sequentially, spaced for upstream
-  courtesy, caches the merged result for 15 minutes in memory and on disk
-  (`.gev-cache/`, gitignored), governs upstream requests with a daily soft cap,
-  and serves the last good result during an outage rather than blanking the
-  layer. GEO 2.0 returns article links inside an HTML blob; the proxy extracts
-  them into structured `{title, url, domain}` rows server-side, so no upstream
-  markup reaches the browser and only `http(s)` links survive. **What the
-  markers are and are not:** each marker is a place GDELT's coverage clustered
-  around, at a **place centroid resolved from article text** — not an incident
-  position, and frequently a city centre. Marker size encodes a
-  **coverage-intensity index** derived from article volume and a declared
-  per-category weight (`EVENT_SEVERITY_WEIGHTS` in `src/data/eventsFeed.js`).
-  That index measures how much a place is being written about, **not how severe
-  an event is**: a well-covered protest in a major media market outranks an
-  under-covered atrocity, and the product copy says so rather than implying a
-  casualty, damage, or risk assessment. GDELT tone and Goldstein scales are
-  deliberately NOT used as a severity axis — GEO 2.0's GeoJSON output carries
-  no per-feature tone, and neither scale answers "how bad is this". Events are
-  location-matched article clusters, not verified incidents, and their absence
-  is never evidence that nothing happened. This layer feeds no detection or
-  targeting surface.
+- **Political Events layer (GDELT 2.0 Event Database).** `/api/events` fetches
+  the keyless 15-minute export files from `data.gdeltproject.org`, keeps a
+  rolling window of them (default 4 h, env-tunable to 24 h), caches in memory
+  and on disk (`.gev-cache/`, gitignored), governs upstream requests with a
+  daily soft cap, and serves the last good window during an outage rather than
+  blanking the layer. Each export is a ZIP of one tab-separated file; the proxy
+  reads it, drops what it cannot plot, deduplicates, ranks, and caps
+  server-side, so no archive handling and no unreduced window reaches the
+  browser. Only `http(s)` source links survive.
+
+  **What this source covers.** The GDELT 2.0 Event Database records **political
+  interactions between two actors**, coded with the CAMEO taxonomy: root codes
+  01–20, spanning public statements, appeals, consultation, diplomatic and
+  material cooperation, aid, investigation, demands, disapproval, rejection,
+  threats, protest, force posture, reduced relations, coercion, assault,
+  fighting, and unconventional mass violence. The layer's five categories are
+  derived from those root codes and nothing else.
+
+  **What this source does not cover.** CAMEO has no code for a natural
+  disaster, no code for humanitarian need, and no code for market or economic
+  activity. These are not gaps this layer works around — they are outside the
+  taxonomy, and **the layer therefore does not carry them at all**:
+
+  - *Natural disasters* are covered instead by the **earthquakes (USGS)** and
+    **FIRMS active-fire** layers, which use purpose-built observational data.
+    An earthquake reaches the Event Database only as a derived political act —
+    an aid pledge coded after it — never as the earthquake.
+  - *Humanitarian* has **no CAMEO equivalent.** The nearest code, `07` PROVIDE
+    AID, is aid as a diplomatic act between actors, which is not a measure of
+    humanitarian need and must not be presented as one.
+  - *Economic* has **no CAMEO equivalent.** The nearest code, `06` MATERIAL
+    COOPERATION, covers trade and economic agreements between states, which is
+    not market or economic-condition data.
+
+  Earlier versions of this layer advertised humanitarian, economic, and
+  disaster categories sourced from GDELT's GKG theme index. They are retired
+  rather than reproduced.
+
+  **What the markers are and are not.** Each marker is one CAMEO-coded
+  interaction, plotted at the **place the action was coded to** — a city
+  centroid resolved from article text, not an incident position. Only
+  city-precision rows are plotted at all; country and state centroids are
+  dropped rather than drawn as points, because a point marker asserts a
+  precision that data does not have. A record is an assertion about what an
+  article said, **not a verified fact**: events are article-derived, not
+  confirmed incidents, and their absence is never evidence that nothing
+  happened. Note also that GDELT's own event date can precede the article by
+  days or years, so a record carries its ingest time and its coded event date
+  separately and is never presented as "happening now" on the strength of the
+  former.
+
+  Marker size encodes a **CAMEO intensity index** combining CAMEO's Goldstein
+  conflict/cooperation scale, article volume, and a declared per-category
+  weight (`EVENT_SEVERITY_WEIGHTS` in `src/data/eventsFeed.js`). Because
+  article volume is one of its terms, it partly measures **how much something
+  is being written about, not how bad it is**: a well-covered diplomatic row in
+  a major media market can outrank an under-covered killing. The product copy
+  says so rather than implying a casualty, damage, or risk assessment. This
+  layer feeds no detection or targeting surface.
+
 - **Cockpit regional briefing.** `/api/regional-brief` rounds aircraft coordinates into 0.1° cache cells, caches results for five minutes, and serializes Nominatim calls at no more than one request per second. Google News RSS is queried with the resolved locality/region first; GDELT is used only when that RSS query fails or is empty. Google's published Google News terms restrict that source to personal, noncommercial use, so commercial deployments must disable/replace it or obtain separate permission; GDELT permits commercial dataset use with citation. The Data attribution popover identifies the active headline sources; article links retain publisher attribution. Headlines are location-query matches, not verified incidents, risk rankings, or evidence that a location is safe. Empty, partial, stale, and unavailable source states remain distinct. Open-Meteo supplies current conditions independently of the news source. `WX OFF` disables cockpit weather rendering only; the Local Info briefing still fetches its source-backed weather values and displays the required linked Open-Meteo credit.
 - **Dynamic weather presentation.** While cockpit mode is active, `/api/weather-effects` requests current Open-Meteo observations for the aircraft/camera location, rounds coordinates into 0.1° cache cells, caches results for five minutes, and may retain a stale observation for up to 30 minutes during a transient outage. WMO condition code selects the visual family; observed cloud cover, precipitation, visibility, wind speed, and wind direction bound its strength and motion. Missing or expired weather renders no synthetic atmospheric effect, and normal globe view never renders the weather overlay.
 

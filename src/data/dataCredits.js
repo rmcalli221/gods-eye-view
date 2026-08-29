@@ -111,10 +111,11 @@ export const DATA_CREDITS = [
   {
     key: 'gdelt-events',
     html:
-      'World events (geolocated news clusters): ' +
+      'Political events (CAMEO-coded interactions): ' +
       '<a href="https://www.gdeltproject.org/about.html" target="_blank" rel="noopener">GDELT Project</a> ' +
-      'GEO 2.0 &mdash; coverage clusters at place centroids, not verified ' +
-      'incidents; linked articles retain publisher terms',
+      '2.0 Event Database &mdash; political interactions at city centroids, ' +
+      'not verified incidents; no disaster, humanitarian or market coverage; ' +
+      'linked articles retain publisher terms',
   },
   {
     key: 'austin-cctv',

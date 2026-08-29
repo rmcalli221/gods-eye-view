@@ -1,11 +1,29 @@
 # Phase 1 migration plan — GEO 2.0 → Event Database export
 
 Companion to `docs/PHASE1-DECISIONS.md`, which holds the evidence and the
-decisions of record. This file is the work plan. **No implementation has
-started.** Two items need a maintainer decision before coding begins (§3).
+decisions of record. This file was the work plan and is kept as the record of
+what was intended.
 
-Branch: `feat/events-layer`. The layer already exists end-to-end against the
-wrong source; this is a source swap, not a greenfield build.
+> **Status: implemented.** Three things did not survive contact with the data,
+> all recorded in `docs/PHASE1-DECISIONS.md` §10, which supersedes this file
+> wherever they disagree:
+>
+> 1. **§3.1's category mapping was defective.** Keying `conflict` on
+>    `quadClass === 4` left `coercion` permanently empty, because QuadClass is
+>    a pure coarsening of `EventRootCode`. All five categories now key on root
+>    codes alone and partition 01-20 exactly.
+> 2. **§3.1's share-link codes were recycled; shipped ones are retired.**
+>    Reusing `d` for `dissent` and `p` for `diplomacy` would have made old
+>    links silently select something they never asked for.
+> 3. **§1.3's dedupe ranked by article volume**, which dropped the fixture's
+>    only protest in favour of a consultation from the same article. The
+>    survivor of a collapsed group is now the most severe row.
+>
+> `LAYER_STATE_VERSION` also stays at 2 rather than being bumped — a bump
+> rejects the whole URL for every layer, not just this option.
+
+Branch: `feat/events-layer`. The layer already existed end-to-end against the
+wrong source; this was a source swap, not a greenfield build.
 
 ---
 
@@ -217,7 +235,7 @@ slice stream has one scale, so a single ranked set is both simpler and correct.
 
 ## 3. Decisions needed before coding
 
-### 3.1 The category model — **blocking**
+### 3.1 The category model — **blocking** *(decided; see the status note above — the mapping below shipped corrected)*
 
 `docs/PHASE1-DECISIONS.md` §7 sets this out: CAMEO has no disaster,
 humanitarian, or economic concept, and 78% of rows are verbal cooperation
