@@ -431,18 +431,42 @@ function dedupeKey(record) {
  * distinct articles), and without this a single story renders as a cluster of
  * stacked markers that reads as several separate incidents.
  *
- * The survivor is the row with the most articles; ties break on the lowest
- * `GLOBALEVENTID`, so the choice is deterministic and testable rather than
- * dependent on input order. `duplicates` is retained so the UI can say
- * "5 reports" instead of drawing five markers.
+ * WHICH ROW SURVIVES IS POLICY, NOT WIRE FORMAT, so it is injectable. One
+ * article commonly yields several DIFFERENT coded events at one place — a
+ * meeting and a demand, or a protest and a statement — and collapsing them by
+ * article volume alone silently discards the more serious one whenever the
+ * duller one was better covered. This module has no notion of severity, so it
+ * defaults to article volume and lets `eventsFeed.js` pass a ranking that
+ * knows about categories.
+ *
+ * Ties break on the lowest `GLOBALEVENTID`, so the choice is deterministic and
+ * testable rather than dependent on input order. `duplicates` is retained so
+ * the UI can say "5 reports" instead of drawing five markers.
  *
  * @param {Array<object>} records Parsed records.
+ * @param {object} [options]
+ * @param {(a: object, b: object) => number} [options.rank] Positive when `a`
+ *   should survive over `b`. Defaults to article volume, then lowest id.
  * @returns {Array<object>} Deduplicated records, each with a `duplicates` count.
  */
-export function dedupeExportRecords(records) {
+export function defaultDedupeRank(a, b) {
+  const articles = (a?.numArticles ?? 0) - (b?.numArticles ?? 0);
+  if (articles !== 0) return articles;
+  return String(b?.id ?? '').localeCompare(String(a?.id ?? ''));
+}
+
+export function dedupeExportRecords(records, { rank = defaultDedupeRank } = {}) {
   const byKey = new Map();
+  const passthrough = [];
   for (const record of Array.isArray(records) ? records : []) {
-    if (!record || !Number.isFinite(record.lat) || !Number.isFinite(record.lon)) continue;
+    if (!record) continue;
+    // A record with no usable coordinate cannot form a location key. Collapsing
+    // is not this function's licence to DISCARD — dropping is the drop rules'
+    // job, and a silent loss here would be invisible to the rejection funnel.
+    if (!Number.isFinite(record.lat) || !Number.isFinite(record.lon)) {
+      passthrough.push({ ...record, duplicates: 1 });
+      continue;
+    }
     const key = dedupeKey(record);
     const held = byKey.get(key);
     if (!held) {
@@ -450,14 +474,9 @@ export function dedupeExportRecords(records) {
       continue;
     }
     held.duplicates += 1;
-    const heldArticles = held.numArticles ?? 0;
-    const nextArticles = record.numArticles ?? 0;
-    const wins = nextArticles > heldArticles
-      || (nextArticles === heldArticles && String(record.id) < String(held.id));
-    if (wins) {
-      const duplicates = held.duplicates;
-      byKey.set(key, { ...record, duplicates });
+    if (rank(record, held) > 0) {
+      byKey.set(key, { ...record, duplicates: held.duplicates });
     }
   }
-  return [...byKey.values()];
+  return [...byKey.values(), ...passthrough];
 }

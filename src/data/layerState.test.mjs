@@ -159,26 +159,48 @@ test('the events category filter round-trips and stays out of a default link', (
   // every share link.
   const state = createDefaultLayerState();
   state.enabledLayerIds = ['events'];
-  assert.equal(state.options.events.categories, 'cphed', 'all five by default');
+  assert.equal(state.options.events.categories, 'cuxs', 'the four default categories');
   assert.ok(!encode(state).includes('n.c.'), 'a default filter is omitted');
 
-  state.options.events.categories = 'cd';
-  assert.ok(encode(state).includes('n.c.cd'), 'a narrowed filter is written');
+  state.options.events.categories = 'cy';
+  assert.ok(encode(state).includes('n.c.cy'), 'a narrowed filter is written');
   const decoded = decodeLayerStateParams(new URLSearchParams(encode(state)));
   assert.deepEqual(decoded.enabledLayerIds, ['events']);
-  assert.equal(decoded.options.events.categories, 'cd');
+  assert.equal(decoded.options.events.categories, 'cy');
 
   // Order-insensitive on the way in, canonical on the way out.
   assert.equal(
-    decodeLayerStateParams(new URLSearchParams('v=2&l=n&lo=n.c.dc')).options.events.categories,
-    'cd',
+    decodeLayerStateParams(new URLSearchParams('v=2&l=n&lo=n.c.yc')).options.events.categories,
+    'cy',
   );
   // A malformed or unknown code rejects the ASSIGNMENT (falling back to the
   // default), matching how every other option token fails closed.
-  for (const bad of ['n.c.z', 'n.c.cc', 'n.c.', 'n.c.cphedx']) {
+  for (const bad of ['n.c.z', 'n.c.cc', 'n.c.', 'n.c.q']) {
     const params = new URLSearchParams(`v=2&l=n&lo=${bad}`);
-    assert.equal(decodeLayerStateParams(params).options.events.categories, 'cphed', bad);
+    assert.equal(decodeLayerStateParams(params).options.events.categories, 'cuxs', bad);
   }
+});
+
+test('links issued under the retired GKG category grammar still resolve', () => {
+  // The category model moved from GKG themes to CAMEO codes, retiring p/h/e/d.
+  // LAYER_STATE_VERSION is deliberately NOT bumped for this: decodeLayerState
+  // rejects the whole URL on a version mismatch, so a bump would discard
+  // camera and every other layer's state to re-grammar one option. Retired
+  // codes are therefore dropped in place and the rest of the link survives.
+  const decodeCategories = (value) => decodeLayerStateParams(
+    new URLSearchParams(`v=2&l=n&lo=n.c.${value}`),
+  ).options.events.categories;
+
+  // conflict + disaster -> conflict; the layer keeps working, minus a category
+  // that no longer exists.
+  assert.equal(decodeCategories('cd'), 'c');
+  // A link naming only retired categories falls back to the default view
+  // rather than blanking the layer.
+  assert.equal(decodeCategories('he'), 'cuxs');
+  assert.equal(decodeCategories('cphed'), 'c');
+  // And the rest of the link is untouched by the retired token.
+  const params = new URLSearchParams('v=2&l=n&lo=n.c.cd');
+  assert.deepEqual(decodeLayerStateParams(params).enabledLayerIds, ['events']);
 });
 
 test('production registry is exact, canonical, and rejects incomplete contracts', async () => {

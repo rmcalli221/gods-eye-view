@@ -1,59 +1,48 @@
 /**
- * GDELT GEO 2.0 event-feed parsing, category specs, and severity scoring.
+ * CAMEO event categories, severity scoring, and the share-link codec.
  *
- * PURE MODULE — no Cesium, no Node built-ins, no I/O. It is imported by BOTH
- * the `/api/events` dev/preview proxy in `vite.config.js` and the globe layer
- * in `src/data/events.js`, so parser and renderer can never disagree about a
- * record's shape. Same split as `firmsCsv.js` ↔ `firmsHeatmap.js` and
- * `tomtomTiles.js` ↔ `traffic.js`: the config cannot import a module that
- * pulls in the Cesium bundle.
+ * PURE MODULE — no Cesium, no Node built-ins, no I/O. Imported by BOTH the
+ * `/api/events` dev/preview proxy in `vite.config.js` and the globe layer in
+ * `src/data/events.js`, so proxy and renderer can never disagree.
  *
- * Upstream: https://api.gdeltproject.org/api/v2/geo/geo
- *   ?query=<category query>&format=GeoJSON&mode=PointData&timespan=24h
+ * This module owns PRESENTATION POLICY. The wire format — 61 columns, FIPS
+ * codes, precision rules — belongs to `gdeltExport.js`, which deliberately
+ * assigns no category. Keeping the two apart is what lets the source change
+ * without the UI changing, and vice versa.
  *
- * WHY GEO 2.0 AND NOT DOC 2.0: GEO returns coordinates GDELT already resolved.
- * DOC returns structured article rows with no coordinates, and the only
- * geocoder wired into this repo is Nominatim, which `fetchRegionalPlace()`
- * deliberately serializes to one request per second — unusable for hundreds of
- * points per refresh. The cost of GEO is that article URLs arrive inside an
- * HTML blob (`properties.html`) instead of structured rows, which
- * `extractArticleLinks` unpacks server-side so raw upstream HTML never reaches
- * the browser.
- *
- * ⚠ THE PARSED SHAPE IS UNVERIFIED AGAINST A LIVE RESPONSE. It was written
- * from GDELT's published documentation in an environment with no route to
- * api.gdeltproject.org. Every field is optional-tolerant (missing → skipped
- * record or null field, never a throw), but the exact `properties.html` markup,
- * whether `count` is always present, and which `theme:` codes actually return
- * volume all still need confirming against real traffic. See
- * `src/data/fixtures/README.md`.
+ * WHAT THIS LAYER COVERS, AND WHAT IT DOES NOT. The GDELT 2.0 Event Database
+ * records POLITICAL INTERACTIONS BETWEEN TWO ACTORS, coded with CAMEO root
+ * codes 01-20. That is the whole ontology. There is no natural-disaster code,
+ * no humanitarian-crisis code, and no market code — so this layer cannot
+ * express those things, and does not pretend to. Disasters are covered by the
+ * `earthquakes` and FIRMS heatmap layers, which have purpose-built data.
+ * See `DATA_SOURCES.md` and `docs/PHASE1-DECISIONS.md` §7.
  */
 
-/** Longest article headline retained; longer titles are truncated. */
-const MAX_TITLE_CHARS = 140;
+import { dedupeExportRecords } from './gdeltExport.js';
+
 /** Longest place label retained. */
 const MAX_PLACE_CHARS = 120;
-/** Articles kept per location per category. */
-export const EVENT_MAX_ARTICLES = 3;
-/** Coordinate rounding used for the cross-category dedupe key (~110 m). */
-const DEDUPE_DECIMALS = 3;
 
 /**
- * The five event categories, in canonical order.
+ * The five categories, in PRECEDENCE order — most severe first.
  *
- * `code` is the single letter this category contributes to the share-link
- * option value (see `OPTION_GROUPS.events` in `src/data/layerState.js`) and is
- * therefore part of the URL contract — never change one for an existing
- * category. `query` is the GDELT query string; `weight` feeds the severity
- * table below.
+ * Each is defined by CAMEO `EventRootCode` alone. An earlier draft mixed
+ * `rootCode` with `quadClass`, which was both redundant and actively harmful:
+ * QuadClass is a pure coarsening of the root code (01-05 -> 1, 06-09 -> 2,
+ * 10-14 -> 3, 15-20 -> 4, confirmed across the whole fixture), so it carries no
+ * information the root code lacks — but a `quadClass === 4` clause in
+ * `conflict` swallowed EVERY root-17 row and left `coercion` permanently
+ * empty. Keying on root codes alone makes the five buckets a total, disjoint
+ * partition of 01-20, which `eventsFeed.test.mjs` asserts directly.
  *
- * ⚠ THE `query` VALUES ARE UNVERIFIED. GKG theme codes are documented but
- * their live volume through the GEO endpoint is not something this environment
- * could measure. A code that returns nothing yields an empty category, not an
- * error.
+ * `code` is the letter this category contributes to the share-link option
+ * value (see `OPTION_GROUPS.events` in `src/data/layerState.js`). Only `c`
+ * carries over from the GKG-theme grammar, because only `conflict` kept its
+ * meaning; see `RETIRED_CATEGORY_CODES`.
  *
  * @type {ReadonlyArray<{id: string, code: string, label: string, color: string,
- *   query: string, weight: number}>}
+ *   roots: ReadonlyArray<string>, weight: number, blurb: string}>}
  */
 export const EVENT_CATEGORIES = Object.freeze([
   Object.freeze({
@@ -61,48 +50,91 @@ export const EVENT_CATEGORIES = Object.freeze([
     code: 'c',
     label: 'CONFLICT',
     color: '#ff4438',
-    query: 'theme:ARMEDCONFLICT',
+    roots: Object.freeze(['18', '19', '20']),
     weight: 1,
+    blurb: 'Assault, fight, unconventional mass violence',
   }),
   Object.freeze({
-    id: 'political',
-    code: 'p',
-    label: 'POLITICAL',
-    color: '#ffb020',
-    query: 'theme:PROTEST',
-    weight: 0.7,
-  }),
-  Object.freeze({
-    id: 'humanitarian',
-    code: 'h',
-    label: 'HUMANITARIAN',
-    color: '#4fc3f7',
-    query: 'theme:HUMANITARIAN_AID',
-    weight: 0.85,
-  }),
-  Object.freeze({
-    id: 'economic',
-    code: 'e',
-    label: 'ECONOMIC',
-    color: '#a78bfa',
-    query: 'theme:ECON_STOCKMARKET',
-    weight: 0.55,
-  }),
-  Object.freeze({
-    id: 'disaster',
-    code: 'd',
-    label: 'DISASTER',
+    id: 'unrest',
+    code: 'u',
+    label: 'UNREST',
     color: '#ff7a1a',
-    query: 'theme:NATURAL_DISASTER',
-    weight: 0.95,
+    roots: Object.freeze(['14']),
+    weight: 0.85,
+    blurb: 'Protest',
+  }),
+  Object.freeze({
+    id: 'coercion',
+    code: 'x',
+    label: 'COERCION',
+    color: '#ffb020',
+    roots: Object.freeze(['13', '15', '16', '17']),
+    weight: 0.8,
+    blurb: 'Threaten, force posture, reduce relations, coerce',
+  }),
+  Object.freeze({
+    id: 'dissent',
+    code: 's',
+    label: 'DISSENT',
+    color: '#a78bfa',
+    roots: Object.freeze(['10', '11', '12']),
+    weight: 0.5,
+    blurb: 'Demand, disapprove, reject',
+  }),
+  Object.freeze({
+    id: 'diplomacy',
+    code: 'y',
+    label: 'DIPLOMACY',
+    color: '#4fc3f7',
+    roots: Object.freeze(['01', '02', '03', '04', '05', '06', '07', '08', '09']),
+    weight: 0.3,
+    blurb: 'Statements, consultation, cooperation, aid',
   }),
 ]);
 
-/** Category ids in canonical order. */
+/** Category ids in canonical (precedence) order. */
 export const EVENT_CATEGORY_IDS = Object.freeze(EVENT_CATEGORIES.map((entry) => entry.id));
+
+/**
+ * Categories on by default.
+ *
+ * `diplomacy` is OFF. It is not a minor category — it is roughly 70% of every
+ * window (statements, consultations and meetings dominate the feed), so
+ * leaving it on renders a globe of diplomatic meetings in which the six
+ * percent of rows that are actual violence are invisible. It stays available
+ * as a chip, and turning it on is a deliberate act.
+ */
+export const EVENT_DEFAULT_CATEGORY_IDS = Object.freeze(
+  EVENT_CATEGORY_IDS.filter((id) => id !== 'diplomacy'),
+);
+
+/**
+ * Share-link codes that existed under the GKG-theme grammar and no longer
+ * name anything.
+ *
+ * `p` was `political` (theme:PROTEST), `h` `humanitarian`, `e` `economic`,
+ * `d` `disaster`. None survives the move to CAMEO: protest is now `unrest`,
+ * and humanitarian, economic and disaster have no CAMEO equivalent at all.
+ *
+ * These letters are DEPRECATED, NOT REUSED. Handing `p` to `diplomacy` or `d`
+ * to `dissent` would have kept old links parsing while silently changing what
+ * they select — a link that asked for protests would come back selecting
+ * diplomatic chatter. Retiring the letters instead means such a link loses
+ * that category and keeps the rest, which is visible rather than deceptive.
+ *
+ * `LAYER_STATE_VERSION` is deliberately NOT bumped for this. `decodeLayerState`
+ * rejects the whole URL on a version mismatch, for every layer at once, so a
+ * bump would break camera, flights and CCTV state to re-grammar one option.
+ * Tolerating retired codes here is the contained fix.
+ */
+export const RETIRED_CATEGORY_CODES = Object.freeze(new Set(['p', 'h', 'e', 'd']));
 
 const CATEGORY_BY_ID = new Map(EVENT_CATEGORIES.map((entry) => [entry.id, entry]));
 const CATEGORY_BY_CODE = new Map(EVENT_CATEGORIES.map((entry) => [entry.code, entry]));
+const CATEGORY_BY_ROOT = new Map();
+for (const entry of EVENT_CATEGORIES) {
+  for (const root of entry.roots) CATEGORY_BY_ROOT.set(root, entry.id);
+}
 
 /**
  * Look up one category spec.
@@ -114,79 +146,119 @@ export function eventCategory(id) {
 }
 
 /**
- * Which severity model `scoreEventSeverity` implements, named so the layer,
- * legend copy, and DATA_SOURCES.md cannot drift from the code.
+ * Assign one CAMEO root code to exactly one category.
  *
- * `coverage-index` is deliberately NOT called severity in user-facing copy: it
- * ranks how much coverage a place is getting, which is not the same question
- * as how bad the underlying event is. A well-covered protest in a major media
- * market outranks an under-covered atrocity. That is a real and unfixable
- * property of article-volume ranking, and it is stated rather than smoothed.
+ * The buckets partition 01-20 with no gaps and no overlaps, so this is a
+ * lookup rather than a search — but it is expressed as a total function with a
+ * null fallback because CAMEO could add a root code and an unknown one must
+ * land nowhere rather than defaulting into a bucket it does not belong in.
+ *
+ * @param {*} rootCode CAMEO EventRootCode, e.g. '19'.
+ * @returns {?string} Category id, or null for an unknown root code.
  */
-export const EVENT_SEVERITY_MODEL = 'coverage-index';
+export function categoryForRootCode(rootCode) {
+  const raw = String(rootCode ?? '').trim();
+  if (!raw) return null;
+  return CATEGORY_BY_ROOT.get(raw.padStart(2, '0')) || null;
+}
 
 /**
- * Severity weights, as one frozen, inspectable table.
+ * Which severity model `scoreEventSeverity` implements, named so the layer,
+ * legend copy and DATA_SOURCES.md cannot drift from the code.
  *
- * The shipped model is coverage-only: GEO 2.0's GeoJSON output carries NO tone
- * per feature (tone is reachable only as a query-side operator, which costs a
- * separate request per tone band). The `tone` block is therefore present but
- * DISABLED — switching to a tone-banded model is a change to this table and
- * its tests, not to the proxy, the layer, or the render path.
+ * `cameo-intensity` ranks how CONFLICTUAL and how WIDELY REPORTED an event is.
+ * It is NOT a casualty estimate, a damage assessment, or a measure of how bad
+ * something is. A well-covered diplomatic row in a major media market can
+ * still outrank an under-covered killing, because article volume is one of the
+ * terms. That is a real property of any coverage-weighted ranking and it is
+ * stated rather than smoothed over.
+ */
+export const EVENT_SEVERITY_MODEL = 'cameo-intensity';
+
+/**
+ * Severity weights, as one frozen inspectable table.
+ *
+ * Each term can be disabled independently, so re-weighting the model is a
+ * change to this table and its tests — not to the proxy, the layer, or the
+ * render path.
  */
 export const EVENT_SEVERITY_WEIGHTS = Object.freeze({
-  /** Per-category multiplier applied to the normalized coverage term. */
+  /** Per-category multiplier — the CAMEO class's own severity ordering. */
   category: Object.freeze(Object.fromEntries(
     EVENT_CATEGORIES.map((entry) => [entry.id, entry.weight]),
   )),
   /**
-   * Coverage term: log1p(count) normalized against the maximum count in the
-   * SAME fetch, so a quiet news day still spreads across the range. `floor`
-   * keeps the least-covered location in a category visible rather than zero.
+   * Coverage term: log1p(numArticles) normalized against the largest count in
+   * the SAME window, so a quiet window still spreads across the range. `floor`
+   * keeps a thinly-covered event visible rather than zero.
    */
-  coverage: Object.freeze({ enabled: true, floor: 0.08 }),
-  /** Reserved for a tone-banded model. See the note above. */
-  tone: Object.freeze({
-    enabled: false,
-    bands: Object.freeze({ severe: 1, elevated: 0.75, baseline: 0.5 }),
-  }),
+  coverage: Object.freeze({ enabled: true, floor: 0.15 }),
+  /**
+   * Goldstein term: CAMEO's own -10..+10 conflict/cooperation intensity, which
+   * the export ships per row. -10 (most conflictual) maps to 1, +10 to the
+   * floor. This is the one term that reads the event itself rather than how
+   * much it was written about.
+   */
+  goldstein: Object.freeze({ enabled: true, floor: 0.25 }),
+  /**
+   * Reserved. `AvgTone` is available per row but is largely redundant with
+   * Goldstein and measures article sentiment rather than event intensity.
+   */
+  tone: Object.freeze({ enabled: false, floor: 0.5 }),
   /** Output range is 0..scale. */
   scale: 100,
 });
 
 /**
- * Score one record's coverage intensity on 0..`scale`.
+ * Score one record on 0..`scale`.
  *
- * @param {{count: ?number, category: string, toneBand: ?string}} record Parsed record.
+ * @param {object} record Parsed record with `category`, `numArticles`, `goldstein`.
  * @param {object} [context] Scoring context.
- * @param {number} [context.maxCount=0] Largest count in the same fetch.
+ * @param {number} [context.maxArticles=0] Largest article count in the same window.
  * @param {object} [context.weights=EVENT_SEVERITY_WEIGHTS] Weight table override.
  * @returns {number} Integer in [0, weights.scale].
  */
-export function scoreEventSeverity(record, { maxCount = 0, weights = EVENT_SEVERITY_WEIGHTS } = {}) {
+export function scoreEventSeverity(record, {
+  maxArticles = 0,
+  weights = EVENT_SEVERITY_WEIGHTS,
+} = {}) {
   const scale = Number.isFinite(weights?.scale) ? weights.scale : 100;
-  const count = Number(record?.count);
-  if (!Number.isFinite(count) || count <= 0) return 0;
 
   let coverage = 1;
   if (weights?.coverage?.enabled !== false) {
-    const ceiling = Number(maxCount);
-    const normalized = Number.isFinite(ceiling) && ceiling > 1
-      ? Math.log1p(count) / Math.log1p(ceiling)
-      : 1;
+    const count = Number(record?.numArticles);
+    const ceiling = Number(maxArticles);
     const floor = Number(weights?.coverage?.floor) || 0;
+    const normalized = Number.isFinite(count) && count > 0 && Number.isFinite(ceiling) && ceiling > 1
+      ? Math.log1p(count) / Math.log1p(ceiling)
+      : 0;
     coverage = floor + (1 - floor) * Math.max(0, Math.min(1, normalized));
+  }
+
+  let goldstein = 1;
+  if (weights?.goldstein?.enabled === true) {
+    const value = Number(record?.goldstein);
+    const floor = Number(weights?.goldstein?.floor) || 0;
+    // -10 (most conflictual) -> 1, +10 (most cooperative) -> floor.
+    const normalized = Number.isFinite(value)
+      ? Math.max(0, Math.min(1, (10 - value) / 20))
+      : 0.5;
+    goldstein = floor + (1 - floor) * normalized;
   }
 
   let tone = 1;
   if (weights?.tone?.enabled === true) {
-    const band = weights.tone.bands?.[String(record?.toneBand || '')];
-    tone = Number.isFinite(band) ? band : (weights.tone.bands?.baseline ?? 1);
+    const value = Number(record?.tone);
+    const floor = Number(weights?.tone?.floor) || 0;
+    const normalized = Number.isFinite(value)
+      ? Math.max(0, Math.min(1, (0 - value) / 20))
+      : 0.5;
+    tone = floor + (1 - floor) * normalized;
   }
 
   const categoryWeight = Number(weights?.category?.[record?.category]);
   const weight = Number.isFinite(categoryWeight) ? categoryWeight : 1;
-  const score = scale * weight * coverage * tone;
+  const score = scale * weight * coverage * goldstein * tone;
   return Math.max(0, Math.min(scale, Math.round(score)));
 }
 
@@ -201,232 +273,77 @@ function cleanText(value, maxLength) {
 }
 
 /**
- * Parse an http(s) URL, rejecting every other scheme.
+ * Dedupe ranking for classified records: most severe wins, then best covered,
+ * then lowest id so the choice is deterministic.
  *
- * Mirrors `safeHttpUrl` in `src/data/regionalBrief.js` — duplicated rather
- * than exported from there because that module is the cockpit's and this one
- * must stay importable by `vite.config.js`.
- * @param {*} value Candidate URL.
- * @returns {?URL} Parsed URL, or null.
+ * @param {object} a Candidate.
+ * @param {object} b Incumbent.
+ * @returns {number} Positive when `a` should survive over `b`.
  */
-function safeHttpUrl(value) {
-  try {
-    const parsed = new URL(String(value ?? ''));
-    return parsed.protocol === 'http:' || parsed.protocol === 'https:' ? parsed : null;
-  } catch {
-    return null;
-  }
-}
-
-/** Minimal entity decode for anchor text; GDELT emits no CDATA in this field. */
-function decodeEntities(value) {
-  return String(value ?? '')
-    .replace(/&nbsp;/gi, ' ')
-    .replace(/&quot;/gi, '"')
-    .replace(/&#0*39;/g, "'")
-    .replace(/&apos;/gi, "'")
-    .replace(/&lt;/gi, '<')
-    .replace(/&gt;/gi, '>')
-    .replace(/&amp;/gi, '&');
-}
-
-const ANCHOR_PATTERN = /<a\s[^>]*href\s*=\s*["']([^"']+)["'][^>]*>([\s\S]*?)<\/a>/gi;
-
-/**
- * Extract structured article links from GEO 2.0's `properties.html` blob.
- *
- * This is the ONLY path from a GEO feature to a source URL, and it is the
- * highest-risk piece of the parser: the exact markup is undocumented beyond
- * "an HTML list of links". Anything that fails to yield an http(s) URL and a
- * non-empty title is dropped, so a markup change degrades to zero articles
- * rather than to garbage. Modelled on `normalizeRssArticles` in
- * `vite.config.js`, which strips tags the same way.
- *
- * The raw HTML never leaves the proxy — only the rows this returns do.
- *
- * @param {*} html Raw `properties.html` value.
- * @param {number} [limit=EVENT_MAX_ARTICLES] Maximum rows to return.
- * @returns {Array<{title: string, url: string, domain: string}>} Article rows.
- */
-export function extractArticleLinks(html, limit = EVENT_MAX_ARTICLES) {
-  const source = String(html ?? '');
-  const cap = Math.max(0, Math.floor(Number(limit) || 0));
-  if (!source || cap === 0) return [];
-  const seen = new Set();
-  const articles = [];
-  ANCHOR_PATTERN.lastIndex = 0;
-  for (const match of source.matchAll(ANCHOR_PATTERN)) {
-    const parsed = safeHttpUrl(decodeEntities(match[1]));
-    if (!parsed) continue;
-    const title = cleanText(decodeEntities(String(match[2]).replace(/<[^>]+>/g, ' ')), MAX_TITLE_CHARS);
-    if (!title) continue;
-    const signature = `${title.toLowerCase()}|${parsed.hostname}`;
-    if (seen.has(signature)) continue;
-    seen.add(signature);
-    articles.push({
-      title,
-      url: parsed.href,
-      domain: parsed.hostname.replace(/^www\./, ''),
-    });
-    if (articles.length >= cap) break;
-  }
-  return articles;
-}
-
-/** Deterministic dedupe/identity key for a coordinate pair. */
-function locationKey(lat, lon) {
-  return `${lat.toFixed(DEDUPE_DECIMALS)},${lon.toFixed(DEDUPE_DECIMALS)}`;
+function severityDedupeRank(a, b) {
+  const severity = (a?.severity ?? 0) - (b?.severity ?? 0);
+  if (severity !== 0) return severity;
+  const articles = (a?.numArticles ?? 0) - (b?.numArticles ?? 0);
+  if (articles !== 0) return articles;
+  return String(b?.id ?? '').localeCompare(String(a?.id ?? ''));
 }
 
 /**
- * Parse one GEO 2.0 GeoJSON response into per-category records.
+ * Attach a category and a severity to parsed export records.
  *
- * Returns `null` — not `[]` — for a structurally wrong payload, so the proxy
- * can tell "this category has no events" from "this is not GeoJSON" and serve
- * stale for the second case. Same distinction `parseFirmsCsv` makes.
+ * Records whose root code names no category are DROPPED rather than bucketed
+ * into a default — an unrecognized CAMEO code is an unknown, and rendering it
+ * under a label that does not fit is worse than not rendering it.
  *
- * @param {*} payload Parsed JSON body.
- * @param {object} options
- * @param {string} options.category Category id this response was fetched for.
- * @param {number} [options.maxRecords=Infinity] Cap on returned records.
- * @param {number} [options.maxArticles=EVENT_MAX_ARTICLES] Articles per record.
- * @returns {?Array<object>} Records, or null when the payload is malformed.
- */
-export function parseGeoFeatureCollection(payload, {
-  category,
-  maxRecords = Infinity,
-  maxArticles = EVENT_MAX_ARTICLES,
-} = {}) {
-  if (!payload || typeof payload !== 'object') return null;
-  if (payload.type !== undefined && payload.type !== 'FeatureCollection') return null;
-  if (!Array.isArray(payload.features)) return null;
-  if (!CATEGORY_BY_ID.has(String(category || ''))) return null;
-
-  const cap = Number.isFinite(maxRecords) ? Math.max(0, Math.floor(maxRecords)) : Infinity;
-  const records = [];
-  for (const feature of payload.features) {
-    if (records.length >= cap) break;
-    const coordinates = feature?.geometry?.coordinates;
-    if (!Array.isArray(coordinates) || coordinates.length < 2) continue;
-    const lon = Number(coordinates[0]);
-    const lat = Number(coordinates[1]);
-    if (!Number.isFinite(lat) || !Number.isFinite(lon)) continue;
-    if (lat < -90 || lat > 90 || lon < -180 || lon > 180) continue;
-
-    const properties = feature.properties && typeof feature.properties === 'object'
-      ? feature.properties
-      : {};
-    const rawCount = Number(properties.count);
-    records.push({
-      id: `evt:${category}:${locationKey(lat, lon)}`,
-      category,
-      lat,
-      lon,
-      place: cleanText(properties.name, MAX_PLACE_CHARS) || null,
-      count: Number.isFinite(rawCount) && rawCount >= 0 ? Math.floor(rawCount) : null,
-      articles: extractArticleLinks(properties.html, maxArticles),
-    });
-  }
-  return records;
-}
-
-/**
- * Score a single category's records against their own maximum count.
+ * Scoring is normalized across the whole window rather than per category:
+ * unlike the GEO version, one slice stream has one scale, so a single ranked
+ * set is both simpler and correct.
  *
- * Scoring is per category on purpose: normalizing across categories would let
- * a high-volume economic feed suppress every disaster point, and the category
- * weight already carries the cross-category ordering.
+ * Dedupe runs AFTER scoring, and the survivor of a collapsed group is the MOST
+ * SEVERE row, not the best-covered one. This ordering is load-bearing: one
+ * article routinely yields several different coded events at one place, and
+ * ranking that group by article volume drops a protest in favour of the
+ * consultation reported alongside it. Article volume only breaks severity
+ * ties. Pass `dedupe: false` to score without collapsing.
  *
- * @param {Array<object>} records Records from `parseGeoFeatureCollection`.
+ * @param {Array<object>} records Records from `parseExportTsv`.
  * @param {object} [options]
  * @param {object} [options.weights] Weight table override.
- * @returns {Array<object>} The same records with `severity` added.
+ * @param {boolean} [options.dedupe=true] Collapse one article at one place.
+ * @returns {Array<object>} Records with `category` and `severity`, severity desc.
  */
-export function scoreCategoryRecords(records, { weights = EVENT_SEVERITY_WEIGHTS } = {}) {
-  if (!Array.isArray(records) || records.length === 0) return [];
-  let maxCount = 0;
-  for (const record of records) {
-    const count = Number(record?.count);
-    if (Number.isFinite(count) && count > maxCount) maxCount = count;
-  }
-  return records.map((record) => ({
-    ...record,
-    severity: scoreEventSeverity(record, { maxCount, weights }),
-  }));
-}
-
-/**
- * Merge every category's scored records into one deduplicated location set.
- *
- * Locations are deduplicated on a 3-decimal coordinate key, because the same
- * city commonly appears in several category queries. Per-category count,
- * severity, and articles are all KEPT under `byCategory` rather than collapsed:
- * filtering to one category must yield that category's own ranking and its own
- * article links, not a blended figure.
- *
- * `maxPoints` is a payload-size guard, applied AFTER dedupe and only to bound
- * the JSON the proxy serves. It deliberately does not pre-rank across
- * categories — the per-category cap in the proxy is what bounds each feed, so
- * a filtered view keeps its depth.
- *
- * @param {Array<{category: string, records: Array<object>}>} groups Scored groups.
- * @param {object} [options]
- * @param {number} [options.maxPoints=Infinity] Payload-size ceiling.
- * @returns {Array<object>} Merged records sorted by severity desc, then id.
- */
-export function mergeCategoryResults(groups, { maxPoints = Infinity } = {}) {
-  const merged = new Map();
-  for (const group of Array.isArray(groups) ? groups : []) {
-    const category = String(group?.category || '');
-    if (!CATEGORY_BY_ID.has(category)) continue;
-    for (const record of Array.isArray(group.records) ? group.records : []) {
-      const lat = Number(record?.lat);
-      const lon = Number(record?.lon);
-      if (!Number.isFinite(lat) || !Number.isFinite(lon)) continue;
-      const key = locationKey(lat, lon);
-      let entry = merged.get(key);
-      if (!entry) {
-        entry = {
-          id: `evt:${key}`,
-          lat,
-          lon,
-          place: record.place ?? null,
-          categories: [],
-          byCategory: {},
-        };
-        merged.set(key, entry);
-      }
-      if (!entry.place && record.place) entry.place = record.place;
-      if (!entry.byCategory[category]) entry.categories.push(category);
-      entry.byCategory[category] = {
-        count: record.count ?? null,
-        severity: Number.isFinite(record.severity) ? record.severity : 0,
-        articles: Array.isArray(record.articles) ? record.articles : [],
-      };
-    }
+export function classifyEventRecords(records, {
+  weights = EVENT_SEVERITY_WEIGHTS,
+  dedupe = true,
+} = {}) {
+  const input = Array.isArray(records) ? records : [];
+  let maxArticles = 0;
+  for (const record of input) {
+    const count = Number(record?.numArticles);
+    if (Number.isFinite(count) && count > maxArticles) maxArticles = count;
   }
 
   const out = [];
-  for (const entry of merged.values()) {
-    entry.categories.sort(
-      (a, b) => EVENT_CATEGORY_IDS.indexOf(a) - EVENT_CATEGORY_IDS.indexOf(b),
-    );
-    let severity = 0;
-    for (const category of entry.categories) {
-      severity = Math.max(severity, entry.byCategory[category].severity);
-    }
-    entry.severity = severity;
-    out.push(entry);
+  for (const record of input) {
+    const category = categoryForRootCode(record?.rootCode);
+    if (!category) continue;
+    const scored = { ...record, category };
+    scored.severity = scoreEventSeverity(scored, { maxArticles, weights });
+    scored.place = cleanText(record?.place, MAX_PLACE_CHARS) || null;
+    out.push(scored);
   }
-  out.sort((a, b) => b.severity - a.severity || a.id.localeCompare(b.id));
-  const cap = Number.isFinite(maxPoints) ? Math.max(0, Math.floor(maxPoints)) : Infinity;
-  return cap === Infinity ? out : out.slice(0, cap);
+  const collapsed = dedupe ? dedupeExportRecords(out, { rank: severityDedupeRank }) : out;
+  collapsed.sort((a, b) => b.severity - a.severity || String(a.id).localeCompare(String(b.id)));
+  return collapsed;
 }
 
 /**
  * Normalize a requested category filter into a canonical, non-empty id list.
- * An empty or fully invalid request means "all categories" — a filter that
- * selects nothing would silently blank the layer.
+ *
+ * An empty or fully invalid request means the DEFAULT set, not "everything":
+ * `diplomacy` is off by default and a filter that selects nothing would blank
+ * the layer.
+ *
  * @param {*} categories Requested ids.
  * @returns {Array<string>} Canonical-order category ids.
  */
@@ -436,14 +353,14 @@ export function normalizeEventCategories(categories) {
       .map((value) => String(value || '').trim().toLowerCase())
       .filter((value) => CATEGORY_BY_ID.has(value)),
   );
-  if (requested.size === 0) return [...EVENT_CATEGORY_IDS];
+  if (requested.size === 0) return [...EVENT_DEFAULT_CATEGORY_IDS];
   return EVENT_CATEGORY_IDS.filter((id) => requested.has(id));
 }
 
 /**
  * Encode a category set as the share-link option value: category `code`
- * letters in canonical order (e.g. `cdehp`). No `.` or `_`, which the `lo`
- * grammar in `layerState.js` reserves as separators.
+ * letters in canonical order. No `.` or `_`, which the `lo` grammar in
+ * `layerState.js` reserves as separators.
  * @param {*} categories Category ids.
  * @returns {string} Encoded value.
  */
@@ -454,23 +371,37 @@ export function encodeEventCategories(categories) {
 }
 
 /**
- * Decode a share-link category value. Returns null (rejecting the assignment,
- * per the codec's fail-closed rule) for anything not a set of known codes.
+ * Decode a share-link category value, tolerating retired codes.
+ *
+ * Three outcomes, deliberately distinct:
+ *   - a known active code contributes its category;
+ *   - a RETIRED code (`p`/`h`/`e`/`d`, the GKG-theme grammar) is DROPPED, and
+ *     the rest of the link still applies;
+ *   - anything else returns null, rejecting the assignment per the codec's
+ *     fail-closed rule.
+ *
+ * A link naming only retired categories decodes to the default set rather than
+ * to nothing — an old `disaster`-only link should show the default globe, not
+ * a blank one.
+ *
  * @param {*} value Encoded value.
  * @returns {?Array<string>} Category ids, or null when invalid.
  */
 export function decodeEventCategories(value) {
   const raw = String(value ?? '');
-  if (!/^[a-z]{1,5}$/.test(raw)) return null;
-  const ids = [];
+  if (!/^[a-z]{1,8}$/.test(raw)) return null;
+  const ids = new Set();
   const seen = new Set();
   for (const code of raw) {
-    const spec = CATEGORY_BY_CODE.get(code);
-    if (!spec || seen.has(code)) return null;
+    if (seen.has(code)) return null;
     seen.add(code);
-    ids.push(spec.id);
+    if (RETIRED_CATEGORY_CODES.has(code)) continue;
+    const spec = CATEGORY_BY_CODE.get(code);
+    if (!spec) return null;
+    ids.add(spec.id);
   }
-  return EVENT_CATEGORY_IDS.filter((id) => ids.includes(id));
+  if (ids.size === 0) return [...EVENT_DEFAULT_CATEGORY_IDS];
+  return EVENT_CATEGORY_IDS.filter((id) => ids.has(id));
 }
 
 /**
@@ -482,28 +413,27 @@ export function decodeEventCategories(value) {
  * is omitted from the URL rather than always written out. This is the one
  * place that knows both.
  *
- * @param {*} value Id array, encoded code string, or null/undefined for "all".
+ * @param {*} value Id array, encoded code string, or null/undefined for default.
  * @returns {?Array<string>} Canonical ids, or null when the value is unusable.
  */
 export function coerceEventCategories(value) {
-  if (value === null || value === undefined) return [...EVENT_CATEGORY_IDS];
+  if (value === null || value === undefined) return [...EVENT_DEFAULT_CATEGORY_IDS];
   if (Array.isArray(value)) return normalizeEventCategories(value);
   if (typeof value === 'string') return decodeEventCategories(value);
   return null;
 }
 
 /**
- * Choose which merged records to render, under the active category filter and
- * the layer's entity budget.
+ * Choose which records to render, under the active category filter and the
+ * layer's entity budget.
  *
  * The filter is applied BEFORE the cap so that narrowing to one category
  * yields that category's own depth rather than whatever survived a global
- * ranking. Each result carries the winning category's own severity, colour,
- * count, and article links.
+ * ranking.
  *
- * @param {Array<object>} records Merged records from `mergeCategoryResults`.
+ * @param {Array<object>} records Classified records.
  * @param {object} [options]
- * @param {Array<string>} [options.categories] Active category ids (default all).
+ * @param {Array<string>} [options.categories] Active category ids (default set).
  * @param {number} [options.maxEntities=Infinity] Entity budget.
  * @returns {Array<object>} Render records, severity desc then id asc.
  */
@@ -511,36 +441,16 @@ export function selectEventsForRender(records, { categories, maxEntities = Infin
   const active = new Set(normalizeEventCategories(categories));
   const selected = [];
   for (const record of Array.isArray(records) ? records : []) {
-    const available = Array.isArray(record?.categories) ? record.categories : [];
-    let best = null;
-    for (const category of available) {
-      if (!active.has(category)) continue;
-      const detail = record.byCategory?.[category];
-      if (!detail) continue;
-      const severity = Number.isFinite(detail.severity) ? detail.severity : 0;
-      if (!best || severity > best.severity
-        || (severity === best.severity
-          && EVENT_CATEGORY_IDS.indexOf(category) < EVENT_CATEGORY_IDS.indexOf(best.category))) {
-        best = { category, severity, detail };
-      }
-    }
-    if (!best) continue;
-    const spec = CATEGORY_BY_ID.get(best.category);
+    if (!active.has(record?.category)) continue;
+    const spec = CATEGORY_BY_ID.get(record.category);
     selected.push({
-      id: record.id,
-      lat: record.lat,
-      lon: record.lon,
-      place: record.place ?? null,
-      category: best.category,
+      ...record,
       categoryLabel: spec.label,
       color: spec.color,
-      severity: best.severity,
-      count: best.detail.count ?? null,
-      articles: Array.isArray(best.detail.articles) ? best.detail.articles : [],
-      categories: available,
+      severity: Number.isFinite(record.severity) ? record.severity : 0,
     });
   }
-  selected.sort((a, b) => b.severity - a.severity || a.id.localeCompare(b.id));
+  selected.sort((a, b) => b.severity - a.severity || String(a.id).localeCompare(String(b.id)));
   const cap = Number.isFinite(maxEntities) ? Math.max(0, Math.floor(maxEntities)) : Infinity;
   return cap === Infinity ? selected : selected.slice(0, cap);
 }

@@ -335,3 +335,16 @@ test('a blank or unusable body yields no records rather than throwing', () => {
     assert.deepEqual(records, []);
   }
 });
+
+test('dedupe collapses, but never silently discards, a record it cannot key', () => {
+  // Dropping belongs to the drop rules, where it is counted in the funnel.
+  // A silent loss inside dedupe would be invisible to every caller.
+  const rows = [
+    { id: '1', lat: 10, lon: 20, url: 'https://example.org/a', numArticles: 1 },
+    { id: '2', url: 'https://example.org/b', numArticles: 1 },
+  ];
+  const out = dedupeExportRecords(rows);
+  assert.equal(out.length, 2);
+  assert.deepEqual(out.map((record) => record.id).sort(), ['1', '2']);
+  for (const record of out) assert.equal(record.duplicates, 1);
+});
