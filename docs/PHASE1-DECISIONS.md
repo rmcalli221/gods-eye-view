@@ -264,8 +264,19 @@ Indices are **1-based** above; in code they are 0-based (`ActionGeo_Lat` is
 
 ### Three traps confirmed in the real data
 
-**(a) Geo country codes are FIPS 10-4, not ISO 3166.** Confirmed directly from
-the fixture, pairing `ActionGeo_CountryCode` with `ActionGeo_FullName`:
+**(a) Geo country codes are FIPS 10-4, not ISO 3166. FIRST-PARTY DOCUMENTED.**
+`gdeltproject.org/data.html` states directly that **CAMEO country codes are
+used in the Actor fields while FIPS country codes are used in the Geo fields**
+— so the two-scheme split is GDELT's documented design, not an inference drawn
+from the data. (Cited by the maintainer from that page; this session could not
+fetch it, as `www.gdeltproject.org` is egress-blocked here.)
+
+That upgrades this from inferred to documented, and it independently explains
+why the actor country columns (8, 18) use a *third* scheme: they are CAMEO
+3-letter codes, which the same statement accounts for.
+
+Confirmed independently against the fixture, pairing `ActionGeo_CountryCode`
+with `ActionGeo_FullName`:
 
 | Code | GDELT means | ISO 3166 would mean |
 | --- | --- | --- |
@@ -465,10 +476,12 @@ expected to:
 
 - **The ZIP fixture.** Resolved — a real export was checked off-sandbox and is
   single-entry with no data descriptor and no Zip64. See §11.
-- **The first-party column header.** NOT resolved, and the command this section
-  used to carry (`CSV.header.dailyupdates.txt`) **returns 404** — the filename
-  was recalled, not fetched. It has been removed rather than replaced with
-  another untested guess. See §12 for what is known and how to close it.
+- **The first-party column header.** Found, at
+  `www.gdeltproject.org/data/lookups/CSV.header.dailyupdates.txt` — the
+  filename this section originally carried was right, the host and path were
+  wrong. It turns out to be the **GDELT 1.0** header (58 columns), and there
+  appears to be no first-party 2.0 header at all. It still corroborates the 2.0
+  map by offset arithmetic. See §12.
 
 ---
 
@@ -658,54 +671,102 @@ curl -sO http://data.gdeltproject.org/gdeltv2/$(curl -s \
 zipinfo -v *.export.CSV.zip | grep -Ei 'entries|zip64|disk|general purpose'
 ```
 
-## 12. The first-party header file: unresolved, and not guessable from here
+## 12. The first-party header file: found, and it is GDELT 1.0
 
-Earlier revisions of this document (§5, §8) told the reader to run:
+**Resolved 2026-08-29 by the maintainer**, off this sandbox — both
+`gdeltproject.org` hosts remain egress-blocked here, so nothing in this section
+was fetched by the session that wrote it. Everything attributed to the header
+file below is the maintainer's first-party observation; what this session
+contributed is the arithmetic check in "Reciprocal verification".
+
+**Corrected location.** The filename an earlier draft named was right; the host
+and path were wrong.
+
+| | |
+| --- | --- |
+| Wrong (404) | `data.gdeltproject.org/gdeltv2/CSV.header.dailyupdates.txt` |
+| **Correct** | `www.gdeltproject.org/data/lookups/CSV.header.dailyupdates.txt` |
+
+**It is the GDELT 1.0 header, not 2.0.** It is filed under GDELT 1.0 and lists
+**58 columns**. Our export is 2.0, which has **61**.
+
+**There appears to be no first-party 2.0 header file at all.** The only 2.0
+schema documentation linked from `gdeltproject.org/data.html` is
+`blog.gdeltproject.org/gdelt-2-0-our-global-world-in-realtime/`, which is prose
+rather than a machine-readable list. That is the likely reason no clean 2.0
+mirror exists and why every mirror in §5 is a community reconstruction.
+
+### The three new fields are INSERTED, not appended
+
+61 − 58 = 3, and the three names absent from the 1.0 list are:
+
+- `Actor1Geo_ADM2Code`
+- `Actor2Geo_ADM2Code`
+- `ActionGeo_ADM2Code`
+
+One per geo block. This settles a question that had been left open: 2.0 does
+**not** simply append fields to 1.0, so no index after the first geo block can
+be carried over from 1.0 reasoning unchanged.
+
+### Reciprocal verification of `COL.ACTION_GEO_LAT`
+
+This yields a second, independent derivation of the single most consequential
+index in the file — the one whose failure mode is a plausible-looking marker in
+the wrong country.
+
+Forward, from the 1.0 file:
 
 ```
-curl -s http://data.gdeltproject.org/gdeltv2/CSV.header.dailyupdates.txt
+1.0 ActionGeo_Lat            position 54
+  + 3 insertions, all preceding it
+  = 2.0 position 57          index 56    == COL.ACTION_GEO_LAT
 ```
 
-**That path does not exist. It returns HTTP 404.** The filename was recalled
-from training, never fetched, and stating it as a verification step was an
-error — the same class of error as the "byte-identical mirrors" claim corrected
-in §5. It has been removed rather than replaced.
+Backward, from our committed 2.0 list (run in this session against
+`src/data/fixtures/gdelt-events-columns.txt`):
 
-**No substitute filename is offered here, because none could be tested.**
-`data.gdeltproject.org` and `www.gdeltproject.org` are both blocked by this
-environment's egress proxy (HTTP 403 / `EGRESS_BLOCKED`) over `curl` and over
-the agent fetch tool, so any alternative path written into this document would
-be another untested guess. Guessing a second filename after the first one 404ed
-would be worse than leaving the gap open.
-
-**What is actually known:**
-
-- The export files themselves ship **no header row** — the 61 columns are
-  positional, which is exactly why an external column list matters.
-- The column map in `src/data/gdeltExport.js` is corroborated by two
-  independent mirrors that agree on all 61 names (§5, re-verified and
-  reproducible), and by 0 type violations against real rows.
-- Whether GDELT publishes a first-party header file at all, and under what
-  name, is **unknown** — not merely unfetched.
-
-**To close this, on a network that can reach GDELT.** Discover the path rather
-than assuming one; start from the project root, which is the only first-party
-URL here that has not been guessed:
-
-```bash
-# Follow the Data / Documentation links from the project root and locate the
-# Event Database codebook or column list. Do not assume a filename.
-open https://www.gdeltproject.org/
-
-# Whatever artifact is found must satisfy this, or the column map is wrong:
-#   - exactly 61 names
-#   - the same order as the mirror sequence in §5
-#   - entries 52-59 are the ActionGeo_* block
+```
+remove Actor1Geo_ADM2Code (pos 40), Actor2Geo_ADM2Code (pos 48),
+       ActionGeo_ADM2Code (pos 56)
+  -> 58 names                        == the reported 1.0 count
+  -> ActionGeo_Lat at position 54    == the reported 1.0 position
 ```
 
-If it turns out GDELT publishes no such file publicly, **record that finding
-here** and treat the mirror agreement in §5 as the standing evidence. That is a
-legitimate resting place; a command that 404s is not.
+Two derivations from independent sources meeting at index 56. It also
+independently corroborates the `ADM1_CODE` / `ADM2_CODE` naming that the
+mechanical test in §5 forced by hand.
+
+**The placement caveat, and why it does not undermine the conclusion.** The
+1.0 file proves the count and which three names are new; it does **not** prove
+each `ADM2Code` was inserted directly after its `ADM1Code`. Placement comes
+from the §5 mirrors, which put the three geo blocks at a strict
+`Type, FullName, CountryCode, ADM1Code, ADM2Code, Lat, Long, FeatureID` in all
+three cases — verified against the committed list this session. So the two
+sources supply different halves and agree: neither is assuming the other's
+result. What would close it first-party is the 2.0 blog post.
+
+### Confirmation status by position
+
+| 2.0 positions | Status |
+| --- | --- |
+| **1–35** (`GLOBALEVENTID` … `AvgTone`) | **First-party confirmed.** Reported identical in the 1.0 file and entirely ahead of any insertion, so no offset applies. |
+| **36–61** (the three geo blocks, `DATEADDED`, `SOURCEURL`) | **First-party confirmed by derivation**, pending the 2.0 blog post. Names and order come from the two agreeing mirrors (§5); the 1.0 file confirms the count, which three fields are new, and that everything before position 40 is unshifted. |
+
+One refinement this session's arithmetic adds: the first insertion is at
+position 40 (`Actor1Geo_ADM2Code`), so positions **1–39** are unshifted, not
+just 1–35. Positions 36–39 (`Actor1Geo_Type`, `_FullName`, `_CountryCode`,
+`_ADM1Code`) are therefore also at 1.0 offsets. They are left in the derived
+tier above rather than promoted, because promoting them needs those four names
+confirmed present in the 1.0 list, and the 58 names were not available to this
+session. The 58-name list would settle it immediately.
+
+### What would still close this completely
+
+Confirm against `blog.gdeltproject.org/gdelt-2-0-our-global-world-in-realtime/`
+that each `ADM2Code` sits between its `ADM1Code` and `Lat`. That is the one
+first-party statement that would move positions 36–61 from derived to direct.
+Note the acceptance criteria have not changed: 61 names, the §5 order,
+positions 52–59 the `ActionGeo_*` block.
 
 ## 13. Verification status at a glance
 
@@ -713,8 +774,12 @@ legitimate resting place; a command that 404s is not.
 | --- | --- |
 | 61 columns, in the order pinned by `COL` | **Corroborated AND test-enforced** — two independent mirrors agree on all 61 names; the sequence is committed as `fixtures/gdelt-events-columns.txt` and `gdeltExport.test.mjs` fails if any `COL` index stops naming its column; 0 type violations against real rows |
 | Mirrors are byte-identical | **False** — corrected in §5; they are different files that agree on the name sequence |
-| Geo country codes are FIPS, not ISO | **Verified** against real rows (CH→China, RS→Russia, UP→Ukraine, HA→Haiti, UK→United Kingdom) |
+| Geo country codes are FIPS, not ISO | **First-party documented** (`gdeltproject.org/data.html`: CAMEO in Actor fields, FIPS in Geo fields) **and verified** against real rows (CH→China, RS→Russia, UP→Ukraine, HA→Haiti, UK→United Kingdom) |
 | `DATEADDED` is the ingest clock, identical file-wide | **Verified** against the fixture |
 | Real export ZIP is single-entry, no data descriptor, no Zip64 | **Verified** by the maintainer against a live capture (§11) |
 | Category distribution and the CAMEO partition | **Verified** against 209 strided rows (§10) |
-| First-party column header file | **UNRESOLVED** — recalled filename 404s; no reachable path; see §12 |
+| First-party column header file | **FOUND — but it is GDELT 1.0, 58 columns** (`www.gdeltproject.org/data/lookups/CSV.header.dailyupdates.txt`). No first-party 2.0 header appears to exist. See §12 |
+| 2.0 adds fields by insertion, not appending | **First-party** — the three absent names are `Actor1Geo_ADM2Code`, `Actor2Geo_ADM2Code`, `ActionGeo_ADM2Code`, one per geo block |
+| `COL.ACTION_GEO_LAT` = index 56 | **Two independent derivations agree** — forward from the 1.0 offset (54 + 3), backward from the committed 2.0 list (remove the three, `ActionGeo_Lat` returns to 54) |
+| Positions 1–35 | **First-party confirmed** — identical in 1.0 and ahead of any insertion |
+| Positions 36–61 | **First-party confirmed by derivation**, pending the 2.0 blog post on `ADM2Code` placement |

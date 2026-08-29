@@ -41,9 +41,16 @@
   error made twice.
 
   **Provenance.** GDELT publishes the export with **no header row** — the
-  columns are positional — and no first-party header file could be reached to
-  confirm the names (see `docs/PHASE1-DECISIONS.md` §12; the path an earlier
-  draft named returns 404). This list is the sequence that **two independent
+  columns are positional — and there appears to be **no first-party GDELT 2.0
+  header file** at all; the only 2.0 schema documentation is prose. GDELT does
+  publish a first-party **1.0** header
+  (`www.gdeltproject.org/data/lookups/CSV.header.dailyupdates.txt`, 58
+  columns), which corroborates this list by offset: 2.0 inserts exactly three
+  fields, one `ADM2Code` per geo block, and removing those three from this file
+  reproduces the 1.0 count and puts `ActionGeo_Lat` back at 1.0 position 54.
+  See `docs/PHASE1-DECISIONS.md` §12.
+
+  The names and order themselves are the sequence that **two independent
   mirrors agree on exactly**, re-verified 2026-08-29:
 
   - `linwoodc3/gdelt2HeaderRows` → `schema_csvs/GDELT_2.0_Events_Column_Labels_Header_Row_Sep2016.csv`

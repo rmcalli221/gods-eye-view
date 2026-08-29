@@ -88,10 +88,21 @@ How to read this:
   disaster categories sourced from GDELT's GKG theme index. They are retired
   rather than reproduced.
 
+  **Country codes.** GDELT uses two different country-coding schemes in one
+  row, and [gdeltproject.org/data.html](https://www.gdeltproject.org/data.html)
+  documents the split first-party: **CAMEO country codes in the Actor fields,
+  FIPS 10-4 country codes in the Geo fields**. The Geo codes this layer plots
+  are therefore FIPS — `CH` is China, not Switzerland — and are carried as
+  `countryFips` so nothing downstream reads them as ISO 3166.
+
   **Column names.** The export ships no header row — its 61 columns are
   positional — so `src/data/fixtures/gdelt-events-columns.txt` commits the
   field names in wire order and `gdeltExport.test.mjs` pins the parser's column
-  map against them. Those are GDELT's own field names, used under the same
+  map against them. GDELT publishes no first-party 2.0 header file; its
+  first-party
+  [1.0 header](https://www.gdeltproject.org/data/lookups/CSV.header.dailyupdates.txt)
+  (58 columns) corroborates the 2.0 map by offset, since 2.0 inserts exactly
+  three fields. Those are GDELT's own field names, used under the same
   GDELT terms and attribution as the data. They were corroborated against two
   independent third-party schema mirrors that agree on the sequence exactly;
   neither mirror file is redistributed here (one is unlicensed, the other

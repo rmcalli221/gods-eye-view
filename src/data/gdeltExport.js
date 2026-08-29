@@ -95,7 +95,12 @@ export const COL = Object.freeze({
  * Which coding scheme each country-ish column uses. Documented as data because
  * getting it wrong is silent: FIPS `CH` is China and ISO `CH` is Switzerland,
  * so an ISO lookup renders Chinese events in the Alps and Austrian events in
- * Australia. Confirmed against the fixture in `docs/PHASE1-DECISIONS.md` §5(a).
+ * Australia.
+ *
+ * The split is GDELT's documented design, not an inference: gdeltproject.org's
+ * data page states that CAMEO country codes are used in the Actor fields while
+ * FIPS country codes are used in the Geo fields. Confirmed independently
+ * against real rows in `docs/PHASE1-DECISIONS.md` §5(a).
  */
 export const COUNTRY_CODE_SCHEMES = Object.freeze({
   [COL.ACTION_GEO_COUNTRY_CODE]: 'FIPS-10-4',
