@@ -101,8 +101,10 @@ How to read this:
   map against them. GDELT publishes no first-party 2.0 header file; its
   first-party
   [1.0 header](https://www.gdeltproject.org/data/lookups/CSV.header.dailyupdates.txt)
-  (58 columns) corroborates the 2.0 map by offset, since 2.0 inserts exactly
-  three fields. Those are GDELT's own field names, used under the same
+  (58 columns) is committed alongside as
+  `gdelt-events-columns-v1.txt` and anchors the 2.0 list by offset — 2.0
+  inserts exactly three fields, one `ADM2Code` per geo block, and the test
+  suite fails if that relationship stops holding. Those are GDELT's own field names, used under the same
   GDELT terms and attribution as the data. They were corroborated against two
   independent third-party schema mirrors that agree on the sequence exactly;
   neither mirror file is redistributed here (one is unlicensed, the other

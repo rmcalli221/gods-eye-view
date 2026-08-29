@@ -675,9 +675,11 @@ zipinfo -v *.export.CSV.zip | grep -Ei 'entries|zip64|disk|general purpose'
 
 **Resolved 2026-08-29 by the maintainer**, off this sandbox — both
 `gdeltproject.org` hosts remain egress-blocked here, so nothing in this section
-was fetched by the session that wrote it. Everything attributed to the header
-file below is the maintainer's first-party observation; what this session
-contributed is the arithmetic check in "Reciprocal verification".
+was fetched by the session that wrote it. The 58 names were supplied by the
+maintainer and are committed verbatim as
+`src/data/fixtures/gdelt-events-columns-v1.txt`; `gdeltExport.test.mjs` now
+pins the 1.0 → 2.0 offset relationship against them, so this section's
+arithmetic is enforced rather than asserted.
 
 **Corrected location.** The filename an earlier draft named was right; the host
 and path were wrong.
@@ -736,37 +738,54 @@ Two derivations from independent sources meeting at index 56. It also
 independently corroborates the `ADM1_CODE` / `ADM2_CODE` naming that the
 mechanical test in §5 forced by hand.
 
-**The placement caveat, and why it does not undermine the conclusion.** The
-1.0 file proves the count and which three names are new; it does **not** prove
-each `ADM2Code` was inserted directly after its `ADM1Code`. Placement comes
-from the §5 mirrors, which put the three geo blocks at a strict
-`Type, FullName, CountryCode, ADM1Code, ADM2Code, Lat, Long, FeatureID` in all
-three cases — verified against the committed list this session. So the two
-sources supply different halves and agree: neither is assuming the other's
-result. What would close it first-party is the 2.0 blog post.
+**The placement question — settled, but not by either header file.** The 1.0
+file gives the count and which three names are new. It cannot fix where each
+`ADM2Code` sits inside its block, because it contains no `ADM2Code` at all; the
+strict `Type, FullName, CountryCode, ADM1Code, ADM2Code, Lat, Long, FeatureID`
+ordering comes from the §5 mirrors.
+
+**The real data settles it, and more decisively than any header file could.**
+If `ActionGeo_ADM2Code` sat after `ActionGeo_Lat` rather than before it, index
+56 would be reading ADM2 codes. Across the 209-row fixture:
+
+| index | content | rows passing a −90…90 latitude check |
+| --- | --- | --- |
+| 55 (`ActionGeo_ADM2Code`) | admin codes — `12552`, `CA02` | **0 / 209** |
+| 56 (`ActionGeo_Lat`) | coordinates | **199 / 209** |
+
+Not one row would survive the shift. And in the rows that name a city the
+coordinates land on it — Vancouver at 49.25, −123.133 — which a shifted map
+cannot produce. `gdeltExport.test.mjs` pins both figures.
+
+So the 2.0 blog post is no longer load-bearing for this map. It would confirm
+the ordering as prose; the data already forbids the alternative.
 
 ### Confirmation status by position
 
 | 2.0 positions | Status |
 | --- | --- |
-| **1–35** (`GLOBALEVENTID` … `AvgTone`) | **First-party confirmed.** Reported identical in the 1.0 file and entirely ahead of any insertion, so no offset applies. |
-| **36–61** (the three geo blocks, `DATEADDED`, `SOURCEURL`) | **First-party confirmed by derivation**, pending the 2.0 blog post. Names and order come from the two agreeing mirrors (§5); the 1.0 file confirms the count, which three fields are new, and that everything before position 40 is unshifted. |
+| **1–39** (`GLOBALEVENTID` … `Actor1Geo_ADM1Code`) | **First-party confirmed.** Present and identical in the 1.0 header, and entirely ahead of the first insertion, so no offset applies. Pinned by `assert.deepEqual(SCHEMA.slice(0, 39), SCHEMA_V1.slice(0, 39))`. |
+| **40–61** (from `Actor1Geo_ADM2Code` on) | **First-party confirmed by offset, plus settled empirically.** Every name is in the 1.0 header at a known position except the three insertions themselves; the offset is enforced by `SCHEMA.filter(not inserted) === SCHEMA_V1`; and the real data forbids the only alternative placement. |
 
-One refinement this session's arithmetic adds: the first insertion is at
-position 40 (`Actor1Geo_ADM2Code`), so positions **1–39** are unshifted, not
-just 1–35. Positions 36–39 (`Actor1Geo_Type`, `_FullName`, `_CountryCode`,
-`_ADM1Code`) are therefore also at 1.0 offsets. They are left in the derived
-tier above rather than promoted, because promoting them needs those four names
-confirmed present in the 1.0 list, and the 58 names were not available to this
-session. The 58-name list would settle it immediately.
+The boundary is 39, not 35. The first insertion is `Actor1Geo_ADM2Code` at 2.0
+position 40, so positions 36–39 (`Actor1Geo_Type`, `_FullName`,
+`_CountryCode`, `_ADM1Code`) are also at 1.0 offsets — and the 58-name list
+confirms all four are present in 1.0 at exactly those positions, which is what
+promoted them from the derived tier.
 
-### What would still close this completely
+### Closed
 
-Confirm against `blog.gdeltproject.org/gdelt-2-0-our-global-world-in-realtime/`
-that each `ADM2Code` sits between its `ADM1Code` and `Lat`. That is the one
-first-party statement that would move positions 36–61 from derived to direct.
-Note the acceptance criteria have not changed: 61 names, the §5 order,
-positions 52–59 the `ActionGeo_*` block.
+Nothing further is owed on the column map. The evidence now stands on four
+independent legs, and `gdeltExport.test.mjs` fails if any of them stops holding:
+
+1. **First-party 1.0 header** — 58 names, committed, positions 1–39 identical.
+2. **Offset arithmetic** — 2.0 minus the three insertions is exactly the 1.0
+   list, in order.
+3. **Two independent 2.0 mirrors** (§5) — agreeing on all 61 names.
+4. **The real data** — a shifted map yields 0/209 plottable latitudes, and
+   coordinates that match the place names they sit beside.
+
+The 2.0 blog post would restate leg 3 in prose. It is no longer needed.
 
 ## 13. Verification status at a glance
 
@@ -778,8 +797,8 @@ positions 52–59 the `ActionGeo_*` block.
 | `DATEADDED` is the ingest clock, identical file-wide | **Verified** against the fixture |
 | Real export ZIP is single-entry, no data descriptor, no Zip64 | **Verified** by the maintainer against a live capture (§11) |
 | Category distribution and the CAMEO partition | **Verified** against 209 strided rows (§10) |
-| First-party column header file | **FOUND — but it is GDELT 1.0, 58 columns** (`www.gdeltproject.org/data/lookups/CSV.header.dailyupdates.txt`). No first-party 2.0 header appears to exist. See §12 |
+| First-party column header file | **FOUND and committed** — GDELT 1.0, 58 columns (`www.gdeltproject.org/data/lookups/CSV.header.dailyupdates.txt`), stored as `fixtures/gdelt-events-columns-v1.txt`. No first-party 2.0 header appears to exist. See §12 |
 | 2.0 adds fields by insertion, not appending | **First-party** — the three absent names are `Actor1Geo_ADM2Code`, `Actor2Geo_ADM2Code`, `ActionGeo_ADM2Code`, one per geo block |
-| `COL.ACTION_GEO_LAT` = index 56 | **Two independent derivations agree** — forward from the 1.0 offset (54 + 3), backward from the committed 2.0 list (remove the three, `ActionGeo_Lat` returns to 54) |
-| Positions 1–35 | **First-party confirmed** — identical in 1.0 and ahead of any insertion |
-| Positions 36–61 | **First-party confirmed by derivation**, pending the 2.0 blog post on `ADM2Code` placement |
+| `COL.ACTION_GEO_LAT` = index 56 | **Four independent legs agree** — 1.0 offset (54 + 3), the committed 2.0 list, both §5 mirrors, and the real rows (0/209 plottable at index 55) |
+| Positions 1–39 | **First-party confirmed and test-pinned** — present and identical in the committed 1.0 header, ahead of the first insertion |
+| Positions 40–61 | **First-party confirmed by offset and settled empirically** — the insert relationship is test-pinned, and a shifted map yields 0/209 plottable latitudes |

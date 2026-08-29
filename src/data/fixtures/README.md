@@ -42,22 +42,16 @@
 
   **Provenance.** GDELT publishes the export with **no header row** — the
   columns are positional — and there appears to be **no first-party GDELT 2.0
-  header file** at all; the only 2.0 schema documentation is prose. GDELT does
-  publish a first-party **1.0** header
-  (`www.gdeltproject.org/data/lookups/CSV.header.dailyupdates.txt`, 58
-  columns), which corroborates this list by offset: 2.0 inserts exactly three
-  fields, one `ADM2Code` per geo block, and removing those three from this file
-  reproduces the 1.0 count and puts `ActionGeo_Lat` back at 1.0 position 54.
-  See `docs/PHASE1-DECISIONS.md` §12.
-
-  The names and order themselves are the sequence that **two independent
-  mirrors agree on exactly**, re-verified 2026-08-29:
+  header file** at all; the only 2.0 schema documentation is prose. The names
+  and order are the sequence that **two independent mirrors agree on exactly**,
+  re-verified 2026-08-29:
 
   - `linwoodc3/gdelt2HeaderRows` → `schema_csvs/GDELT_2.0_Events_Column_Labels_Header_Row_Sep2016.csv`
   - the `gdelt` PyPI package 0.1.14 → `gdelt-0.1.14.data/data/data/events2.csv`
 
   Different channels, filenames, sizes and table layouts; identical 61-name
-  sequence. The reproduce script is in `docs/PHASE1-DECISIONS.md` §5.
+  sequence. The reproduce script is in `docs/PHASE1-DECISIONS.md` §5, and the
+  1.0 header below anchors the whole list to a first-party source by offset.
 
   **Why the names only, and not either mirror file.** The GitHub repo carries
   **no license** (all rights reserved) and the PyPI package is **GPL-3.0** —
@@ -66,6 +60,26 @@
   of field names in a data format: GDELT's own, factual rather than expressive,
   and covered by GDELT's terms (unrestricted use with citation). The mirrors
   are the corroboration route, not the licensed source of this file.
+
+- `gdelt-events-columns-v1.txt` — GDELT **1.0**'s 58 field names, in order,
+  from the first-party header at
+  `www.gdeltproject.org/data/lookups/CSV.header.dailyupdates.txt`. This is not
+  the format the layer parses; it is the **anchor that ties the 2.0 list above
+  to a first-party source**.
+
+  2.0 differs from 1.0 by exactly three INSERTED fields — `Actor1Geo_ADM2Code`,
+  `Actor2Geo_ADM2Code`, `ActionGeo_ADM2Code`, one per geo block — not by
+  appended ones, so indices after the first geo block cannot be carried over
+  from 1.0 unchanged. `gdeltExport.test.mjs` pins the relationship: strip those
+  three names from the 2.0 list and what remains must equal this file exactly,
+  positions 1–39 must be identical, and `ActionGeo_Lat` must land at 1.0 index
+  53 plus three insertions = 2.0 index 56.
+
+  The 1.0 file contains no `ADM2Code`, so it cannot fix where those fields sit
+  within a block — the mirrors supply that. The real data settles it: at index
+  55 **0 of 209 rows** hold a value in latitude range, against 199 at index 56,
+  so a one-column shift is impossible rather than merely unconventional. That
+  is also pinned. See `docs/PHASE1-DECISIONS.md` §12.
 
 - `gdelt-export-slice.export.CSV.zip` — the 209 rows above, in a ZIP container
   named the way GDELT names them, with the member file

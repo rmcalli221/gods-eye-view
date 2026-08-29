@@ -30,6 +30,10 @@ const SAMPLE = readFixture('gdelt-export-sample.tsv');
 const EDGE = readFixture('gdelt-export-edge.tsv');
 /** GDELT's own 61 field names, in order. See `fixtures/README.md`. */
 const SCHEMA = readFixture('gdelt-events-columns.txt').split('\n').filter(Boolean);
+/** GDELT 1.0's 58 field names — first-party, and the offset anchor for the above. */
+const SCHEMA_V1 = readFixture('gdelt-events-columns-v1.txt').split('\n').filter(Boolean);
+/** The three fields 2.0 inserts into 1.0, one per geo block. */
+const V2_INSERTIONS = ['Actor1Geo_ADM2Code', 'Actor2Geo_ADM2Code', 'ActionGeo_ADM2Code'];
 
 const SAMPLE_LINES = SAMPLE.split('\n').filter((line) => line.trim());
 /** Raw fields of one row, by GLOBALEVENTID. */
@@ -125,6 +129,65 @@ test('the real fixture has exactly as many columns as the schema names', () => {
   for (const line of SAMPLE_LINES) {
     assert.equal(line.split('\t').length, SCHEMA.length);
   }
+});
+
+// GDELT publishes no first-party 2.0 header, but it does publish a 1.0 one
+// (www.gdeltproject.org/data/lookups/CSV.header.dailyupdates.txt). 2.0 differs
+// from it by exactly three INSERTED fields, so the 1.0 file anchors the 2.0
+// map by offset — an independent route to the same indices the mirrors give.
+test('the 2.0 column list is the first-party 1.0 list plus three inserted fields', () => {
+  assert.equal(SCHEMA_V1.length, 58);
+  assert.equal(SCHEMA.length - SCHEMA_V1.length, V2_INSERTIONS.length);
+  for (const name of V2_INSERTIONS) {
+    assert.ok(SCHEMA.includes(name), `2.0 has ${name}`);
+    assert.ok(!SCHEMA_V1.includes(name), `1.0 does not have ${name}`);
+  }
+  // The whole relationship in one assertion: strip the insertions from 2.0 and
+  // what remains must be the first-party 1.0 list, exactly and in order.
+  assert.deepEqual(SCHEMA.filter((name) => !V2_INSERTIONS.includes(name)), SCHEMA_V1);
+});
+
+test('positions 1-39 are unshifted between 1.0 and 2.0', () => {
+  // The first insertion is Actor1Geo_ADM2Code at 2.0 index 39, so everything
+  // before it carries 1.0 offsets unchanged and is first-party twice over.
+  assert.equal(SCHEMA.indexOf('Actor1Geo_ADM2Code'), 39);
+  assert.deepEqual(SCHEMA.slice(0, 39), SCHEMA_V1.slice(0, 39));
+  assert.equal(SCHEMA[38], 'Actor1Geo_ADM1Code');
+  assert.notEqual(SCHEMA[39], SCHEMA_V1[39], 'and they diverge from 40 onward');
+});
+
+test('ActionGeo_Lat derives to the same index from 1.0 as from the 2.0 mirrors', () => {
+  const v1Index = SCHEMA_V1.indexOf('ActionGeo_Lat');
+  assert.equal(v1Index, 53, '1.0 position 54');
+  // Every insertion precedes it, so the offset is the full count.
+  const precedingInsertions = V2_INSERTIONS
+    .filter((name) => SCHEMA.indexOf(name) < SCHEMA.indexOf('ActionGeo_Lat')).length;
+  assert.equal(precedingInsertions, 3);
+  assert.equal(v1Index + precedingInsertions, COL.ACTION_GEO_LAT);
+  assert.equal(COL.ACTION_GEO_LAT, 56);
+});
+
+// The 1.0 file constrains where the ADM2Code fields go but cannot fix it: it
+// contains no ADM2Code at all. The mirrors put each one between its ADM1Code
+// and its Lat. THE REAL DATA SETTLES IT, and far more decisively than either
+// header file — a one-column shift is not merely unconventional, it is
+// impossible against these rows.
+test('a one-column shift is impossible: index 55 holds no plottable latitude', () => {
+  const plausibleLat = (value) => {
+    const text = String(value ?? '').trim();
+    if (!text) return false;
+    const parsed = Number(text);
+    return Number.isFinite(parsed) && parsed >= -90 && parsed <= 90;
+  };
+  let atLat = 0;
+  let atAdm2 = 0;
+  for (const line of SAMPLE_LINES) {
+    const fields = line.split('\t');
+    if (plausibleLat(fields[COL.ACTION_GEO_LAT])) atLat += 1;
+    if (plausibleLat(fields[COL.ACTION_GEO_LAT - 1])) atAdm2 += 1;
+  }
+  assert.equal(atLat, 199, 'the mapped column really does hold latitudes');
+  assert.equal(atAdm2, 0, 'the column before it holds none — ADM2 codes, not coordinates');
 });
 
 test('coordinates come from ActionGeo, never from an actor geography', () => {
