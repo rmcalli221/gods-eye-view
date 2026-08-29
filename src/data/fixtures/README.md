@@ -31,6 +31,35 @@
   rows). `DATEADDED` is `20260829004500` on every row — it is the export
   file's own timestamp, identical for every record in the file.
 
+- `gdelt-events-columns.txt` — GDELT's **61 Event Database field names, one
+  per line, in wire order**. Nothing else: no types, no descriptions, no rows.
+
+  This is the fixture `gdeltExport.test.mjs` pins `COL` against, which is what
+  turns the column map from a claim in a document into a test failure. The
+  comparison is mechanical (lowercase, drop underscores) with no hand-written
+  constant-to-name table, so it cannot pass by agreeing with a transcription
+  error made twice.
+
+  **Provenance.** GDELT publishes the export with **no header row** — the
+  columns are positional — and no first-party header file could be reached to
+  confirm the names (see `docs/PHASE1-DECISIONS.md` §12; the path an earlier
+  draft named returns 404). This list is the sequence that **two independent
+  mirrors agree on exactly**, re-verified 2026-08-29:
+
+  - `linwoodc3/gdelt2HeaderRows` → `schema_csvs/GDELT_2.0_Events_Column_Labels_Header_Row_Sep2016.csv`
+  - the `gdelt` PyPI package 0.1.14 → `gdelt-0.1.14.data/data/data/events2.csv`
+
+  Different channels, filenames, sizes and table layouts; identical 61-name
+  sequence. The reproduce script is in `docs/PHASE1-DECISIONS.md` §5.
+
+  **Why the names only, and not either mirror file.** The GitHub repo carries
+  **no license** (all rights reserved) and the PyPI package is **GPL-3.0** —
+  neither is redistributable inside this MIT repo, and both files also carry
+  GDELT's codebook description prose. What is committed here is the bare list
+  of field names in a data format: GDELT's own, factual rather than expressive,
+  and covered by GDELT's terms (unrestricted use with citation). The mirrors
+  are the corroboration route, not the licensed source of this file.
+
 - `gdelt-export-slice.export.CSV.zip` — the 209 rows above, in a ZIP container
   named the way GDELT names them, with the member file
   `20260829004500.export.CSV`. Standard local file header: general-purpose

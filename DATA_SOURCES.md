@@ -88,6 +88,16 @@ How to read this:
   disaster categories sourced from GDELT's GKG theme index. They are retired
   rather than reproduced.
 
+  **Column names.** The export ships no header row — its 61 columns are
+  positional — so `src/data/fixtures/gdelt-events-columns.txt` commits the
+  field names in wire order and `gdeltExport.test.mjs` pins the parser's column
+  map against them. Those are GDELT's own field names, used under the same
+  GDELT terms and attribution as the data. They were corroborated against two
+  independent third-party schema mirrors that agree on the sequence exactly;
+  neither mirror file is redistributed here (one is unlicensed, the other
+  GPL-3.0), only the factual list of names. See
+  `docs/PHASE1-DECISIONS.md` §5 and §12.
+
   **What the markers are and are not.** Each marker is one CAMEO-coded
   interaction, plotted at the **place the action was coded to** — a city
   centroid resolved from article text, not an incident position. Only

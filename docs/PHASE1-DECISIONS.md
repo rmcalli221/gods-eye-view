@@ -199,6 +199,14 @@ coverage.
 2. Both list exactly **61 columns**, matching the fixture's 61.
 3. Every one of the 39 named indices in `COL` (`src/data/gdeltExport.js`) was
    checked to land on the column name it claims. **Result: 0 mismatches.**
+   This check is no longer a one-off: the agreed 61-name sequence is committed
+   as `src/data/fixtures/gdelt-events-columns.txt`, and `gdeltExport.test.mjs`
+   now asserts every `COL` entry against it by a mechanical name comparison —
+   no hand-written mapping, so it cannot pass by repeating a transcription
+   error. Mutation-checked against an off-by-one, an actor-vs-action swap, and
+   a corrupted fixture; all three fail the suite. Only the names are committed:
+   the GitHub mirror is unlicensed and the PyPI one GPL-3.0, so neither file is
+   redistributed here.
 4. Every column was then validated against the real fixture rows for declared
    type (INTEGER / FLOAT / STRING) and value domain.
    **Result: 0 type violations.**
@@ -703,7 +711,7 @@ legitimate resting place; a command that 404s is not.
 
 | Claim | Status |
 | --- | --- |
-| 61 columns, in the order pinned by `COL` | **Corroborated** — two independent mirrors agree on all 61 names; 0 mismatches against `COL`; 0 type violations against real rows |
+| 61 columns, in the order pinned by `COL` | **Corroborated AND test-enforced** — two independent mirrors agree on all 61 names; the sequence is committed as `fixtures/gdelt-events-columns.txt` and `gdeltExport.test.mjs` fails if any `COL` index stops naming its column; 0 type violations against real rows |
 | Mirrors are byte-identical | **False** — corrected in §5; they are different files that agree on the name sequence |
 | Geo country codes are FIPS, not ISO | **Verified** against real rows (CH→China, RS→Russia, UP→Ukraine, HA→Haiti, UK→United Kingdom) |
 | `DATEADDED` is the ingest clock, identical file-wide | **Verified** against the fixture |

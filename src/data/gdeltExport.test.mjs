@@ -28,6 +28,8 @@ const readFixture = (name) => fs.readFileSync(path.join(__dirname, 'fixtures', n
 
 const SAMPLE = readFixture('gdelt-export-sample.tsv');
 const EDGE = readFixture('gdelt-export-edge.tsv');
+/** GDELT's own 61 field names, in order. See `fixtures/README.md`. */
+const SCHEMA = readFixture('gdelt-events-columns.txt').split('\n').filter(Boolean);
 
 const SAMPLE_LINES = SAMPLE.split('\n').filter((line) => line.trim());
 /** Raw fields of one row, by GLOBALEVENTID. */
@@ -71,22 +73,58 @@ test('every parsed field reads the column its name claims', () => {
   assert.equal(record.isRoot, fields[25] === '1');
 });
 
-test('the column map itself matches the codebook positions', () => {
-  // Spelled out rather than derived, so a "helpful" renumbering has to argue
-  // with the codebook instead of silently agreeing with itself.
-  assert.equal(COL.GLOBAL_EVENT_ID, 0);
-  assert.equal(COL.SQLDATE, 1);
-  assert.equal(COL.IS_ROOT_EVENT, 25);
-  assert.equal(COL.EVENT_ROOT_CODE, 28);
-  assert.equal(COL.QUAD_CLASS, 29);
-  assert.equal(COL.NUM_ARTICLES, 33);
-  assert.equal(COL.AVG_TONE, 34);
-  assert.equal(COL.ACTION_GEO_TYPE, 51);
-  assert.equal(COL.ACTION_GEO_LAT, 56);
-  assert.equal(COL.ACTION_GEO_LONG, 57);
-  assert.equal(COL.DATE_ADDED, 59);
-  assert.equal(COL.SOURCE_URL, 60);
-  assert.equal(EXPORT_COLUMN_COUNT, 61);
+test('the committed column list is GDELT\'s 61 names, in order', () => {
+  assert.equal(SCHEMA.length, EXPORT_COLUMN_COUNT);
+  assert.equal(SCHEMA.length, 61);
+  assert.equal(new Set(SCHEMA).size, 61, 'no duplicate names');
+  // Spot-anchor the ends and the block that matters most, so a wholesale
+  // corruption of the fixture cannot pass by being internally consistent.
+  assert.equal(SCHEMA[0], 'GLOBALEVENTID');
+  assert.equal(SCHEMA[1], 'SQLDATE');
+  assert.equal(SCHEMA[59], 'DATEADDED');
+  assert.equal(SCHEMA[60], 'SOURCEURL');
+  assert.deepEqual(SCHEMA.slice(51, 59), [
+    'ActionGeo_Type', 'ActionGeo_FullName', 'ActionGeo_CountryCode',
+    'ActionGeo_ADM1Code', 'ActionGeo_ADM2Code', 'ActionGeo_Lat',
+    'ActionGeo_Long', 'ActionGeo_FeatureID',
+  ]);
+});
+
+// The regression guard that makes the column map a test failure rather than a
+// documentation claim. Every entry in COL is checked against GDELT's own field
+// name at that index.
+//
+// The comparison is MECHANICAL — lowercase, drop underscores — with no
+// hand-written constant-to-name table anywhere. That is the point: a table
+// written by hand can encode the same transcription error twice and agree with
+// itself. Here the only way COL.ACTION_GEO_LAT can sit at index 56 is if
+// GDELT's 57th field really is ActionGeo_Lat.
+test('every COL constant names the column it indexes', () => {
+  const normalize = (value) => String(value).toLowerCase().replaceAll('_', '');
+  const entries = Object.entries(COL);
+  assert.ok(entries.length >= 39, 'the map is populated');
+  for (const [constant, index] of entries) {
+    assert.ok(
+      Number.isInteger(index) && index >= 0 && index < EXPORT_COLUMN_COUNT,
+      `COL.${constant} = ${index} is inside the 61-column range`,
+    );
+    assert.equal(
+      normalize(SCHEMA[index]),
+      normalize(constant),
+      `COL.${constant} is index ${index}, which GDELT calls "${SCHEMA[index]}"`,
+    );
+  }
+});
+
+test('no two COL constants claim the same column', () => {
+  const indices = Object.values(COL);
+  assert.equal(new Set(indices).size, indices.length);
+});
+
+test('the real fixture has exactly as many columns as the schema names', () => {
+  for (const line of SAMPLE_LINES) {
+    assert.equal(line.split('\t').length, SCHEMA.length);
+  }
 });
 
 test('coordinates come from ActionGeo, never from an actor geography', () => {
