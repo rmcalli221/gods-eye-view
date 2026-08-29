@@ -38,17 +38,25 @@
 
 - `gdelt-export-datadesc.export.CSV.zip` — 3 rows in a ZIP written to an
   **unseekable stream**, which sets general-purpose bit 3 and zeroes the
-  local-header sizes, moving them into a trailing data descriptor. This is the
-  container variant that breaks a reader which trusts the local header, so it
-  is the one the reader in `vite.config.js` is pinned against.
+  local-header sizes, moving them into a trailing data descriptor — the
+  container variant that would break a reader trusting the local header. GDELT
+  does not currently emit this shape (see below); the fixture pins the reader's
+  defensive path against it.
 
   **Provenance of both archives.** GDELT's own `.zip` files could not be
-  fetched — `data.gdeltproject.org` is blocked by this environment's egress
-  proxy (HTTP 403). They were built from the real TSV above with Python's
-  `zipfile`, a **different implementation from the reader under test**, and
-  independently validated with `unzip -t`. Reproduce with the script in
-  `docs/PHASE1-DECISIONS.md` §11. A capture of an archive as GDELT actually
-  serves it is still owed; see §11 for what that would add.
+  fetched here — `data.gdeltproject.org` is blocked by this environment's
+  egress proxy (HTTP 403). They were built from the real TSV above with
+  Python's `zipfile`, a **different implementation from the reader under
+  test**, and independently validated with `unzip -t`. Reproduce with the
+  script in `docs/PHASE1-DECISIONS.md` §11.
+
+  A real export has since been checked off-sandbox: single entry, local
+  signature `504B0304`, flags `0000`, EOCD `06054B50` — **no data descriptor,
+  no Zip64**. So GDELT writes the shape `gdelt-export-slice…zip` pins, and
+  `gdelt-export-datadesc…zip` covers a variant GDELT does not currently emit.
+  That fixture is kept deliberately: a streamed writer is a normal thing for a
+  publisher to adopt without notice, and the failure mode if GDELT did would be
+  a silently empty file rather than an error.
 
 - `gdelt-export-edge.tsv` — hand-built, five rows, **CRLF line endings** and a
   trailing blank line, derived from a real row so the 61-column layout cannot

@@ -2262,6 +2262,14 @@ function readZipCentralDirectory(buf) {
  * wrong-answer, not a crash. In that case the sizes come from the central
  * directory instead.
  *
+ * A real export was checked and GDELT currently writes the SIMPLE shape:
+ * single entry, flags 0000, no data descriptor, no Zip64. The branch below is
+ * therefore defensive, and kept on purpose — a publisher can switch to a
+ * streamed writer without announcing it, and the failure mode if GDELT did
+ * would be an empty window rather than an error anyone would notice. Zip64 and
+ * multi-entry archives are deliberately NOT handled: unlike the descriptor
+ * case they fail loudly, so they would be a bug report, not silent data loss.
+ *
  * Two independent size guards: the declared uncompressed size is rejected
  * before any work is done, and `maxOutputLength` bounds what inflate will
  * actually produce, so a header that lies about its size cannot exhaust memory.
