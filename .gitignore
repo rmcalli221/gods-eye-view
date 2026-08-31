@@ -14,3 +14,10 @@ output/
 
 export.zip
 gdelt-sample/
+
+gkg.zip
+ex.zip
+gkgtmp/
+extmp/
+lastupdate.txt
+probe-gkg.cjs
