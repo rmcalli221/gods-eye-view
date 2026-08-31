@@ -1618,6 +1618,20 @@ implements no `getDetectableObjects()` and feeds no detection surface. Clicking
 a marker selects it; clicking the selected marker again opens its source
 article in a new tab.
 
+Markers are horizon-culled against an `EllipsoidalOccluder` on `camera.moveEnd`
+— never per frame, so the layer still takes no continuous-render hold. This is
+required, not an optimisation: the markers set
+`disableDepthTestDistance: Number.POSITIVE_INFINITY` so a marker is never
+swallowed by the terrain it stands on, which also means nothing occludes them
+and far-side events render through the planet. It applies to both map stacks —
+google-3d hides the Cesium globe so nothing writes far-side depth, and on the
+globe stacks that flag overrides the depth that is written. The occlusion test
+uses a 12 m lifted anchor, never the render position: marker positions sit
+exactly on the WGS84 ellipsoid, which `EllipsoidalOccluder` treats as a limb
+boundary case and judges hidden slightly before the true tangent, so near-limb
+markers would otherwise blink out for a datum reason. Same lift and rationale
+as the flights and FIRMS layers.
+
 The five categories are derived from CAMEO `EventRootCode` alone and partition
 roots 01-20 exactly: conflict (18-20), unrest (14), coercion (13, 15-17),
 dissent (10-12), diplomacy (01-09). `diplomacy` is off by default — it is

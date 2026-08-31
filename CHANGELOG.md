@@ -5,6 +5,16 @@ of current runtime behavior, see [`docs/CURRENT-STATE.md`](docs/CURRENT-STATE.md
 
 ## [Unreleased] — 2026-08-24
 
+### Fixed
+
+- Political Events markers no longer render through the globe. Events on the
+  far side of the planet were drawn over the near side — Asia visible with the
+  camera over North America — because the markers are always-on-top
+  (`disableDepthTestDistance`, so a marker is never swallowed by the terrain it
+  stands on) and nothing else occluded them. They are now horizon-culled
+  against an ellipsoid occluder on camera settle, the same pass the radio,
+  CCTV, flights, and FIRMS layers already run, in both map stacks.
+
 ### Changed
 
 - Moved the events layer off the GDELT GEO 2.0 query API and onto the GDELT 2.0

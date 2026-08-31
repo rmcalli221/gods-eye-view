@@ -11,11 +11,13 @@ import { fileURLToPath } from 'node:url';
 import path from 'node:path';
 import * as Cesium from 'cesium';
 import {
+  EVENTS_CULL_LIFT_M,
   EVENTS_MAX_ENTITIES,
   EVENTS_OVERLAY_COHORT_LIMIT,
   EVENTS_OVERLAY_COLLISION_CAPACITY,
   createEventOverlayEntry,
   createEventsLayer,
+  eventCullPosition,
   eventLabelText,
   mapAnalystRecord,
   selectEventOverlayCohort,
@@ -50,10 +52,36 @@ function proxyPayload({ stale = false, sliceCount = 16, events = FIXTURE_EVENTS 
 }
 
 /** Minimal viewer double: data-source collection plus a stubbed scene pick. */
-function fakeViewer({ pickResult = null } = {}) {
+/**
+ * Camera double with a real `positionWC` and a `moveEnd` event, so the horizon
+ * pass runs the production path. Without a camera the pass returns early and
+ * every test around it is a false green.
+ */
+function fakeCamera(lon = -97.7, lat = 30.2, height = 25_000_000) {
+  const listeners = [];
+  return {
+    positionWC: Cesium.Cartesian3.fromDegrees(lon, lat, height),
+    moveEnd: {
+      addEventListener: (fn) => { listeners.push(fn); },
+      removeEventListener: (fn) => {
+        const i = listeners.indexOf(fn);
+        if (i >= 0) listeners.splice(i, 1);
+      },
+    },
+    listeners,
+    /** Move the camera and fire moveEnd, the way Cesium would. */
+    flyTo(nextLon, nextLat, nextHeight = height) {
+      this.positionWC = Cesium.Cartesian3.fromDegrees(nextLon, nextLat, nextHeight);
+      for (const fn of [...listeners]) fn();
+    },
+  };
+}
+
+function fakeViewer({ pickResult = null, camera = fakeCamera() } = {}) {
   const dataSources = [];
   return {
     dataSources,
+    camera,
     scene: {
       canvas: { id: 'canvas' },
       pick: () => pickResult,
@@ -693,6 +721,206 @@ test('a marker with no article link never opens anything on a repeat click', asy
     assert.deepEqual(opened, []);
     layer.destroy(viewer);
   });
+});
+
+
+// ── Horizon culling ─────────────────────────────────────────────────────────
+//
+// Reported defect: markers for events in Asia rendered while the camera was
+// over North America. These markers set `disableDepthTestDistance: INFINITY`
+// so nothing occludes them, in either map stack — the Cesium globe is hidden
+// under google-3d, and on the globe stacks that flag overrides the depth that
+// is written. An explicit occluder pass is the only thing standing between the
+// layer and markers punching through the planet.
+
+const ASIA = { lon: 116.4, lat: 39.9 };     // Beijing — the reported case
+const NORTH_AMERICA = { lon: -97.7, lat: 30.2 };
+
+/** One render record at a given place, enough for the layer to draw it. */
+const eventAt = (id, { lon, lat }) => ({
+  id, lon, lat, place: id, category: 'conflict', severity: 50, numArticles: 3,
+  url: 'https://example.org/a',
+});
+
+test('the occlusion anchor is lifted, and the lift is what fixes the limb case', () => {
+  const lifted = eventCullPosition(NORTH_AMERICA.lon, NORTH_AMERICA.lat);
+  const carto = Cesium.Cartographic.fromCartesian(lifted);
+  assert.ok(Math.abs(carto.height - EVENTS_CULL_LIFT_M) < 0.01);
+  assert.equal(EVENTS_CULL_LIFT_M, 12);
+
+  // Why the lift exists, measured against Cesium's own occluder rather than
+  // asserted. Marker positions are built at height 0 — exactly ON the
+  // ellipsoid — and EllipsoidalOccluder treats that as a limb boundary case,
+  // judging it hidden BEFORE the true tangent. At this camera a height-0 point
+  // reads hidden while the lifted one is still visible, so without the lift a
+  // band of near-limb markers would blink out for a datum reason. Height 0
+  // behaves identically to a point 22 m underground.
+  const camera = Cesium.Cartesian3.fromDegrees(
+    NORTH_AMERICA.lon, NORTH_AMERICA.lat, 1_500_000,
+  );
+  const occluder = new Cesium.EllipsoidalOccluder(Cesium.Ellipsoid.WGS84, camera);
+  const limbLon = NORTH_AMERICA.lon + 41.87;
+  const atSurface = Cesium.Cartesian3.fromDegrees(limbLon, NORTH_AMERICA.lat, 0);
+  const atLift = eventCullPosition(limbLon, NORTH_AMERICA.lat);
+  assert.equal(occluder.isPointVisible(atSurface), false, 'height 0 false-hides');
+  assert.equal(occluder.isPointVisible(atLift), true, 'the lifted anchor does not');
+});
+
+test('markers behind the planet are hidden while near-side markers render', async () => {
+  const camera = fakeCamera(NORTH_AMERICA.lon, NORTH_AMERICA.lat, 12_000_000);
+  const viewer = viewerWithSources({ camera });
+  const layer = createEventsLayer({
+    overlayHost: { setEntries() {}, setVisible() {}, clearSource() {} },
+    screenSpaceEventHandlerFactory: NOOP_HANDLER_FACTORY,
+  });
+  const events = [eventAt('near', NORTH_AMERICA), eventAt('far', ASIA)];
+  await withFetch(async () => okResponse(proxyPayload({ events })), async () => {
+    layer.init(viewer);
+    layer.enable(viewer);
+    await layer.update(viewer, {});
+
+    const byId = new Map(viewer.sources[0].entities.values.map((e) => [e.id, e]));
+    assert.equal(byId.size, 2, 'both markers exist as entities');
+    // The defect verbatim: with the camera over North America, Asia must not
+    // be drawn through the globe.
+    assert.equal(byId.get('near').show, true, 'the near-side marker renders');
+    assert.equal(byId.get('far').show, false, 'the far-side marker does not');
+    layer.destroy(viewer);
+  });
+});
+
+test('the pass recomputes when the camera moves, not per frame', async () => {
+  const camera = fakeCamera(NORTH_AMERICA.lon, NORTH_AMERICA.lat, 12_000_000);
+  const viewer = viewerWithSources({ camera });
+  const layer = createEventsLayer({
+    overlayHost: { setEntries() {}, setVisible() {}, clearSource() {} },
+    screenSpaceEventHandlerFactory: NOOP_HANDLER_FACTORY,
+  });
+  const events = [eventAt('near', NORTH_AMERICA), eventAt('far', ASIA)];
+  await withFetch(async () => okResponse(proxyPayload({ events })), async () => {
+    layer.init(viewer);
+    layer.enable(viewer);
+    await layer.update(viewer, {});
+    assert.equal(camera.listeners.length, 1, 'exactly one moveEnd subscription');
+
+    const byId = new Map(viewer.sources[0].entities.values.map((e) => [e.id, e]));
+    assert.equal(byId.get('far').show, false);
+
+    // Fly to the other side of the planet; the answer must invert.
+    camera.flyTo(ASIA.lon, ASIA.lat, 12_000_000);
+    assert.equal(byId.get('far').show, true, 'Asia is now the near side');
+    assert.equal(byId.get('near').show, false, 'and North America is behind the limb');
+    layer.destroy(viewer);
+  });
+});
+
+test('a settled camera dirties nothing on a repeat pass', async () => {
+  const camera = fakeCamera(NORTH_AMERICA.lon, NORTH_AMERICA.lat, 12_000_000);
+  const viewer = viewerWithSources({ camera });
+  const layer = createEventsLayer({
+    overlayHost: { setEntries() {}, setVisible() {}, clearSource() {} },
+    screenSpaceEventHandlerFactory: NOOP_HANDLER_FACTORY,
+  });
+  const events = [eventAt('near', NORTH_AMERICA), eventAt('far', ASIA)];
+  await withFetch(async () => okResponse(proxyPayload({ events })), async () => {
+    layer.init(viewer);
+    layer.enable(viewer);
+    await layer.update(viewer, {});
+
+    // Count writes to `show` across a moveEnd that did not actually move.
+    let writes = 0;
+    for (const entity of viewer.sources[0].entities.values) {
+      let value = entity.show;
+      Object.defineProperty(entity, 'show', {
+        configurable: true,
+        get: () => value,
+        set: (next) => { value = next; writes += 1; },
+      });
+    }
+    for (const fn of [...camera.listeners]) fn();
+    assert.equal(writes, 0, 'an unmoved camera writes no show flags');
+    layer.destroy(viewer);
+  });
+});
+
+test('the cull is map-stack independent and subscribes to no stack event', async () => {
+  // Unlike CCTV, whose geometry genuinely resolves differently between the
+  // photoreal and globe regimes, this test is pure camera-vs-WGS84 geometry
+  // with no surface-height dependency. It must give the same answer in every
+  // stack — so a stack change alone must not perturb it, and the layer must
+  // not have quietly grown a listener for one.
+  const camera = fakeCamera(NORTH_AMERICA.lon, NORTH_AMERICA.lat, 12_000_000);
+  const viewer = viewerWithSources({ camera });
+  const layer = createEventsLayer({
+    overlayHost: { setEntries() {}, setVisible() {}, clearSource() {} },
+    screenSpaceEventHandlerFactory: NOOP_HANDLER_FACTORY,
+  });
+  const events = [eventAt('near', NORTH_AMERICA), eventAt('far', ASIA)];
+
+  const added = [];
+  const realAdd = globalThis.window?.addEventListener;
+  globalThis.window = globalThis.window || {};
+  globalThis.window.addEventListener = (type) => { added.push(type); };
+  try {
+    await withFetch(async () => okResponse(proxyPayload({ events })), async () => {
+      layer.init(viewer);
+      layer.enable(viewer);
+      await layer.update(viewer, {});
+      const byId = new Map(viewer.sources[0].entities.values.map((e) => [e.id, e]));
+      const before = { near: byId.get('near').show, far: byId.get('far').show };
+
+      assert.ok(
+        !added.includes('gev:map-stack-changed'),
+        'no stack listener: the horizon test has no surface dependency to re-resolve',
+      );
+      // Both regimes need the cull equally — google-3d hides the Cesium globe
+      // so nothing writes far-side depth, and on globe stacks
+      // disableDepthTestDistance overrides the depth that is written.
+      assert.deepEqual(
+        { near: byId.get('near').show, far: byId.get('far').show },
+        before,
+        'a stack change alone does not alter horizon visibility',
+      );
+      layer.destroy(viewer);
+    });
+  } finally {
+    if (realAdd) globalThis.window.addEventListener = realAdd;
+  }
+});
+
+test('teardown removes the camera subscription', async () => {
+  const camera = fakeCamera();
+  const viewer = viewerWithSources({ camera });
+  const layer = createEventsLayer({
+    overlayHost: { setEntries() {}, setVisible() {}, clearSource() {} },
+    screenSpaceEventHandlerFactory: NOOP_HANDLER_FACTORY,
+  });
+  layer.init(viewer);
+  layer.enable(viewer);
+  assert.equal(camera.listeners.length, 1);
+  layer.disable(viewer);
+  assert.equal(camera.listeners.length, 0, 'disable unsubscribes');
+
+  layer.enable(viewer);
+  assert.equal(camera.listeners.length, 1, 'and re-enable resubscribes exactly once');
+  layer.destroy(viewer);
+  assert.equal(camera.listeners.length, 0, 'destroy unsubscribes');
+});
+
+test('overlay labels are culled against the lifted anchor, not the surface point', () => {
+  const position = Cesium.Cartesian3.fromDegrees(10, 20, 0);
+  const cullPosition = eventCullPosition(10, 20);
+  const entry = createEventOverlayEntry({
+    id: 'x', position, cullPosition, title: 'X', accent: '#fff', severity: 10,
+  });
+  assert.equal(entry.cullPosition, cullPosition);
+  assert.equal(entry.horizonCull, true, 'the overlay host runs its own cull too');
+  // Falls back to the render position when no lifted anchor is supplied, so an
+  // older call site degrades to the previous behaviour rather than to null.
+  const bare = createEventOverlayEntry({
+    id: 'y', position, title: 'Y', accent: '#fff', severity: 10,
+  });
+  assert.equal(bare.cullPosition, position);
 });
 
 // ── Contract surface ────────────────────────────────────────────────────────

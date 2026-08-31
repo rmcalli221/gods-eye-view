@@ -11,6 +11,12 @@ import {
   selectEntityContext,
 } from './contextStore.js';
 import { isOwnedByOtherLayer, registerPickOwner, resolvePickId, unregisterPickOwner } from './pickRegistry.js';
+import { horizonOccluder } from './iconOrientation.js';
+// Reused rather than reimplemented: `applyHorizonCull` is written against any
+// `{length, get(i)}` shape precisely so it is not billboard-specific, and this
+// layer's entities satisfy it. See the horizon-culling note in the header.
+import { applyHorizonCull } from './firmsHeatmap.js';
+import { governorRequestRender } from '../renderGovernor.js';
 import {
   EVENT_CATEGORIES,
   EVENT_SEVERITY_MODEL,
@@ -47,6 +53,18 @@ import {
  * That centroid property is also why this layer deliberately implements NO
  * `getDetectableObjects()`: feeding city centroids into panoptic detection
  * would draw target boxes on city centres and label them as detected objects.
+ *
+ * HORIZON CULLING IS MANDATORY HERE, NOT AN OPTIMISATION. These markers set
+ * `disableDepthTestDistance: Number.POSITIVE_INFINITY` so a marker is never
+ * swallowed by the terrain it stands on — which also means NOTHING occludes
+ * them, and events in Asia render straight through the planet while the camera
+ * is over North America. That is true in BOTH map stacks: on google-3d the
+ * Cesium globe is hidden so nothing writes far-side depth at all, and on the
+ * globe stacks the depth that is written is overridden by that same flag. The
+ * fix is the explicit `EllipsoidalOccluder` pass every other always-on-top
+ * layer runs (`radio.js`, `cctv.js`, `flights.js`, `firmsHeatmap.js`),
+ * recomputed on `camera.moveEnd` — never per frame, so the layer keeps taking
+ * no continuous-render hold.
  */
 
 const API_URL = '/api/events';
@@ -58,12 +76,40 @@ export const EVENTS_OVERLAY_COLLISION_CAPACITY = 24;
 export const EVENTS_MAX_ENTITIES = 300;
 /** Poll cadence. The proxy's own TTL is 15 min, matching GDELT's publish cycle. */
 export const EVENTS_UPDATE_INTERVAL_MS = 10 * 60_000;
+/**
+ * Height of the occlusion-test point, in metres. NEVER used for rendering.
+ *
+ * Marker positions are built at height 0 — exactly on the WGS84 ellipsoid —
+ * and `EllipsoidalOccluder` treats an exactly-on-ellipsoid point as a limb
+ * boundary case, judging it hidden slightly BEFORE the true tangent. Measured
+ * against Cesium from a 1.5 Mm camera over Austin, a height-0 point goes hidden
+ * at 41.82° of longitude offset while a lifted one survives to 41.95°, so a
+ * band of near-limb markers would blink out for a datum reason rather than a
+ * geometric one. Height 0 behaves identically to a point 22 m UNDERGROUND.
+ *
+ * 12 m matches the lift the flights and FIRMS layers already use for the same
+ * reason (`CULL_LIFT_M` in `firmsHeatmap.js`, whose `cellCullPosition` documents
+ * the identical height-0 case for aggregated heat cells).
+ */
+export const EVENTS_CULL_LIFT_M = 12;
 
 const DEFAULT_OVERLAY_HOST = Object.freeze({
   setEntries: setOverlayEntries,
   setVisible: setOverlaySourceVisible,
   clearSource: clearOverlaySource,
 });
+
+/**
+ * Occlusion-test anchor for one record: the marker's ground position lifted to
+ * `EVENTS_CULL_LIFT_M`. This NEVER feeds rendering — the marker itself is
+ * clamped to ground, and drawing it 12 m up would float it off the terrain.
+ * @param {number} lon Longitude in degrees.
+ * @param {number} lat Latitude in degrees.
+ * @returns {Cesium.Cartesian3} Lifted anchor.
+ */
+export function eventCullPosition(lon, lat) {
+  return Cesium.Cartesian3.fromDegrees(lon, lat, EVENTS_CULL_LIFT_M);
+}
 
 /**
  * Build the source-owned presentation for one ambient event label.
@@ -73,12 +119,17 @@ const DEFAULT_OVERLAY_HOST = Object.freeze({
  * @param {string} input.title Short place label.
  * @param {string} input.accent Source-owned category color.
  * @param {number} input.severity CAMEO intensity index, 0..100.
+ * @param {Cesium.Cartesian3} [input.cullPosition] Lifted occlusion anchor; the
+ *   overlay host tests this instead of `position` so a label does not
+ *   false-hide at the limb for the datum reason described on
+ *   `EVENTS_CULL_LIFT_M`.
  * @returns {object} Overlay entry.
  */
-export function createEventOverlayEntry({ id, position, title, accent, severity }) {
+export function createEventOverlayEntry({ id, position, title, accent, severity, cullPosition }) {
   return {
     id: String(id),
     position,
+    cullPosition: cullPosition || position,
     variant: 'label',
     title,
     accent,
@@ -199,6 +250,17 @@ export function createEventsLayer({
   let _abort = null;
   let _selectedId = null;
   let _rowControlsListener = null;
+  /** camera.moveEnd handle for the horizon pass; removed on disable/destroy. */
+  let _horizonCullListener = null;
+  /** Last camera position the horizon pass ran against, for the skip check. */
+  let _lastCullCameraPosition = null;
+  /**
+   * Index-aligned occlusion inputs for `applyHorizonCull`. Kept beside the
+   * entities rather than on the render records so nothing JSON-facing
+   * (`getAnalystRecords`) ever sees a Cesium type.
+   * @type {{entities: Array<object>, cullPositions: Array<Cesium.Cartesian3>}}
+   */
+  let _cullTargets = { entities: [], cullPositions: [] };
   /** Merged records from the last successful poll, pre-filter. */
   let _records = [];
   /** Rendered records by entity id, for pick resolution. */
@@ -237,12 +299,14 @@ export function createEventsLayer({
     });
     _dataSource.entities.removeAll();
     _renderedById.clear();
+    _cullTargets = { entities: [], cullPositions: [] };
 
     const overlayEntries = [];
     for (const record of selected) {
       const position = Cesium.Cartesian3.fromDegrees(record.lon, record.lat);
+      const cullPosition = eventCullPosition(record.lon, record.lat);
       const color = Cesium.Color.fromCssColorString(record.color);
-      _dataSource.entities.add({
+      const entity = _dataSource.entities.add({
         id: record.id,
         position,
         point: {
@@ -266,9 +330,12 @@ export function createEventsLayer({
         },
       });
       _renderedById.set(record.id, record);
+      _cullTargets.entities.push(entity);
+      _cullTargets.cullPositions.push(cullPosition);
       overlayEntries.push(createEventOverlayEntry({
         id: record.id,
         position,
+        cullPosition,
         title: eventLabelText(record),
         accent: record.color,
         severity: record.severity,
@@ -288,6 +355,53 @@ export function createEventsLayer({
       );
     }
     if (_selectedId && !_renderedById.has(_selectedId)) _selectedId = null;
+    // A rebuild produces entities defaulting to show=true, so the pass must run
+    // before the next frame or a poll would flash far-side markers for a tick.
+    applyEventHorizonCull({ force: true });
+  }
+
+  /**
+   * Hide markers the planet is in front of.
+   *
+   * Event-driven, never per frame: `camera.moveEnd` is the only trigger
+   * besides a render rebuild, and the position check below makes a repeated
+   * call with a stationary camera free. `applyHorizonCull` writes `show` only
+   * when it actually flips, so a settled camera dirties nothing.
+   *
+   * This is deliberately NOT subscribed to `gev:map-stack-changed`. The test
+   * is pure camera-vs-WGS84 geometry with no dependency on surface heights, so
+   * it gives the same answer in every map stack — unlike CCTV, whose geometry
+   * genuinely resolves differently between photoreal and globe regimes. A
+   * stack swap that also moves the camera is covered by `moveEnd` anyway.
+   *
+   * @param {object} [options]
+   * @param {boolean} [options.force=false] Run even if the camera has not moved.
+   */
+  function applyEventHorizonCull({ force = false } = {}) {
+    if (!_dataSource || !_viewer?.camera) return;
+    const cameraPosition = _viewer.camera.positionWC;
+    if (!force && _lastCullCameraPosition && cameraPosition
+      && _lastCullCameraPosition.x === cameraPosition.x
+      && _lastCullCameraPosition.y === cameraPosition.y
+      && _lastCullCameraPosition.z === cameraPosition.z) {
+      return;
+    }
+    _lastCullCameraPosition = cameraPosition
+      ? { x: cameraPosition.x, y: cameraPosition.y, z: cameraPosition.z }
+      : null;
+
+    const occluder = horizonOccluder(_viewer.camera);
+    if (!occluder) return;
+    const { entities, cullPositions } = _cullTargets;
+    const before = entities.filter((entity) => entity.show !== false).length;
+    const visible = applyHorizonCull(
+      { length: entities.length, get: (index) => entities[index] },
+      occluder,
+      cullPositions,
+    );
+    // The pass can land after the camera settles and the governor parks the
+    // scene; a changed show flag needs one frame to become visible.
+    if (visible !== before) governorRequestRender('events-horizon');
   }
 
   /** Resolve a scene pick to one of this layer's rendered records, or null. */
@@ -350,6 +464,21 @@ export function createEventsLayer({
     }, Cesium.ScreenSpaceEventType.LEFT_CLICK);
   }
 
+  function installHorizonCullListener(viewer) {
+    if (_horizonCullListener || !viewer?.camera?.moveEnd?.addEventListener) return;
+    _horizonCullListener = () => applyEventHorizonCull();
+    viewer.camera.moveEnd.addEventListener(_horizonCullListener);
+  }
+
+  function removeHorizonCullListener() {
+    if (!_horizonCullListener) return;
+    try {
+      (_viewer?.camera?.moveEnd?.removeEventListener)?.(_horizonCullListener);
+    } catch { /* camera already torn down */ }
+    _horizonCullListener = null;
+    _lastCullCameraPosition = null;
+  }
+
   function removeClickHandler() {
     if (!_clickHandler) return;
     try {
@@ -395,6 +524,7 @@ export function createEventsLayer({
       overlayHost.setVisible(EVENTS_OVERLAY_SOURCE_ID, true);
       registerPickOwner('events', (pickedId) => _renderedById.has(String(pickedId)));
       installClickHandler(viewer || _viewer);
+      installHorizonCullListener(viewer || _viewer);
       render();
     },
 
@@ -404,6 +534,7 @@ export function createEventsLayer({
       // a disabled layer and republish the overlay source it just cleared.
       abortInflight('events layer disabled');
       removeClickHandler();
+      removeHorizonCullListener();
       unregisterPickOwner('events');
       if (_selectedId) {
         _selectedId = null;
@@ -496,6 +627,7 @@ export function createEventsLayer({
       _enabled = false;
       abortInflight('events layer destroyed');
       removeClickHandler();
+      removeHorizonCullListener();
       unregisterPickOwner('events');
       try {
         clearSelectedEntityContextForLayer('events');
@@ -510,6 +642,7 @@ export function createEventsLayer({
       _viewer = null;
       _records = [];
       _renderedById.clear();
+      _cullTargets = { entities: [], cullPositions: [] };
       _selectedId = null;
       _count = 0;
       _lastUpdate = null;
