@@ -1324,6 +1324,115 @@ test('a fictional entity is rendered exactly like a real one — a stated limit'
   ]);
 });
 
+
+test('a GKG fetch happens on hover, once per slice, and never otherwise', async () => {
+  const camera = fakeCamera(NORTH_AMERICA.lon, NORTH_AMERICA.lat, 12_000_000);
+  const viewer = viewerWithSources({ camera });
+  const clicks = clickHandlerFactory();
+  const host = recordingHost();
+  const layer = createEventsLayer({
+    overlayHost: host, screenSpaceEventHandlerFactory: clicks.factory,
+  });
+  const events = [
+    { ...eventAt('a', NORTH_AMERICA), slice: '20260829004500', url: 'https://x/a' },
+    { ...eventAt('b', NORTH_AMERICA), slice: '20260829004500', url: 'https://x/b' },
+  ];
+  const calls = [];
+  const fetchImpl = async (url) => {
+    calls.push(String(url));
+    if (String(url).startsWith('/api/events/entities')) {
+      return okResponse({
+        enabled: true,
+        slice: '20260829004500',
+        entities: { 'https://x/a': { persons: ['george santos'], organizations: ['white house'] } },
+      });
+    }
+    return okResponse(proxyPayload({ events }));
+  };
+
+  await withFetch(fetchImpl, async () => {
+    layer.init(viewer);
+    layer.enable(viewer);
+    await layer.update(viewer, {});
+    // A poll, a render and a camera move must not cost 5.3 MB.
+    assert.equal(calls.filter((u) => u.includes('/entities')).length, 0,
+      'nothing but hover triggers enrichment');
+    camera.flyTo(NORTH_AMERICA.lon + 1, NORTH_AMERICA.lat, 12_000_000);
+    assert.equal(calls.filter((u) => u.includes('/entities')).length, 0);
+
+    const entityA = viewer.sources[0].entities.values.find((e) => e.id === 'a');
+    viewer._setPick({ id: entityA });
+    clicks.helpers.hover();
+    await new Promise((resolve) => { setTimeout(resolve, 20); });
+    const asked = calls.filter((u) => u.includes('/entities'));
+    assert.equal(asked.length, 1, 'hovering asks once');
+    assert.match(asked[0], /slice=20260829004500/);
+
+    // The card gains the entity lines once they land.
+    const card = host.last().find((e) => e.variant === 'card');
+    assert.ok(card.details.includes('George Santos'), 'entities reached the card');
+    assert.ok(!card.details.includes('Assault, fight, unconventional mass violence'));
+
+    // A second marker in the SAME slice reuses the loaded map.
+    const entityB = viewer.sources[0].entities.values.find((e) => e.id === 'b');
+    viewer._setPick({ id: entityB });
+    await new Promise((resolve) => { setTimeout(resolve, EVENTS_HOVER_THROTTLE_MS + 40); });
+    clicks.helpers.hover({ x: 4, y: 4 });
+    assert.equal(calls.filter((u) => u.includes('/entities')).length, 1, 'slice paid for once');
+    // ...and falls back cleanly, since /x/b has no GKG row in the response.
+    const cardB = host.last().find((e) => e.variant === 'card');
+    assert.equal(cardB.id, 'b:card');
+    assert.ok(cardB.details.includes('Assault, fight, unconventional mass violence'));
+    layer.destroy(viewer);
+  });
+});
+
+test('entity enrichment being off or failing never breaks the card', async () => {
+  for (const [label, entitiesResponse] of [
+    ['disabled', { enabled: false, slice: null, entities: {} }],
+    ['empty', { enabled: true, slice: '20260829004500', entities: {} }],
+  ]) {
+    const camera = fakeCamera(NORTH_AMERICA.lon, NORTH_AMERICA.lat, 12_000_000);
+    const viewer = viewerWithSources({ camera });
+    const clicks = clickHandlerFactory();
+    const host = recordingHost();
+    const layer = createEventsLayer({
+      overlayHost: host, screenSpaceEventHandlerFactory: clicks.factory,
+    });
+    const events = [{ ...eventAt('a', NORTH_AMERICA), slice: '20260829004500', url: 'https://x/a' }];
+    let asks = 0;
+    await withFetch(async (url) => {
+      if (String(url).startsWith('/api/events/entities')) { asks += 1; return okResponse(entitiesResponse); }
+      return okResponse(proxyPayload({ events }));
+    }, async () => {
+      layer.init(viewer);
+      layer.enable(viewer);
+      await layer.update(viewer, {});
+      const entity = viewer.sources[0].entities.values[0];
+      viewer._setPick({ id: entity });
+      clicks.helpers.hover();
+      await new Promise((resolve) => { setTimeout(resolve, 20); });
+
+      const card = host.last().find((e) => e.variant === 'card');
+      assert.ok(card, `${label}: the card still renders`);
+      assert.ok(card.details.includes('Assault, fight, unconventional mass violence'),
+        `${label}: falls back to the category description`);
+
+      // An unavailable slice is remembered, so a hover burst does not re-ask.
+      for (let i = 0; i < 5; i += 1) {
+        viewer._setPick(null);
+        await new Promise((resolve) => { setTimeout(resolve, EVENTS_HOVER_THROTTLE_MS + 10); });
+        clicks.helpers.hover();
+        viewer._setPick({ id: entity });
+        clicks.helpers.hover();
+      }
+      await new Promise((resolve) => { setTimeout(resolve, EVENTS_HOVER_THROTTLE_MS + 40); });
+      assert.equal(asks, 1, `${label}: asked once, then remembered as unavailable`);
+      layer.destroy(viewer);
+    });
+  }
+});
+
 // ── Contract surface ────────────────────────────────────────────────────────
 
 test('the layer satisfies the DataLayerManager contract and omits getDetectableObjects', () => {

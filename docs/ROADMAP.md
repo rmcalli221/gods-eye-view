@@ -41,6 +41,16 @@ Selection round-tripping. The layer registers entity context on click and the
 panel would need to both read that and drive it, without the two fighting over
 who owns the current selection. Worth designing before building.
 
+## Built: named entities on the event card
+
+**Shipped 2026-08-29.** Coverage measured at 98.5% of plottable events (199 of
+202) carrying at least one person or organization, 100% joining to a GKG row —
+well past the 60% line set below. Implemented as lazy-per-slice behind
+`GDELT_GKG_ENABLED`, off by default. The investigation that led there is kept
+below, because its conclusions still hold: **there is no headline available**,
+and the entity names are the best derivable substitute rather than a
+replacement for one.
+
 ## Investigated, not built: article headlines on the event card
 
 The hover card currently ends with the category's own description, which is

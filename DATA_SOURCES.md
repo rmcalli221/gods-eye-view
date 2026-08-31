@@ -31,6 +31,7 @@ How to read this:
 | **Open-Meteo** | Current weather in the cockpit Local Info page and cockpit-local dynamic atmospheric effects | [CC BY 4.0 data licence and adjacent-link attribution requirement](https://open-meteo.com/en/licence) | Linked "Weather data by Open-Meteo.com" beside the displayed local data |
 | **Google News RSS** | Primary locality-matched headlines in the cockpit Regional News page | [Google News Terms of Service](https://www.google.com/intl/en_us/terms_google_news.html) restrict use to personal, noncommercial use; linked articles remain third-party publisher content and retain publisher terms | "Google News RSS" plus each article's linked publisher/domain |
 | **GDELT Project DOC 2.0** | Fail-soft fallback for location-matched cockpit headlines | [GDELT Terms of Use](https://www.gdeltproject.org/about.html#termsofuse): unrestricted academic/commercial/governmental dataset use, with citation and link required; linked articles retain publisher terms | "GDELT Project" plus each article's linked publisher/domain |
+| **GDELT Project 2.0 GKG** | Optional per-article named entities on the Political Events hover card (off by default) | [GDELT Terms of Use](https://www.gdeltproject.org/about.html#termsofuse): unrestricted academic/commercial/governmental dataset use, with citation and link required; linked articles retain publisher terms | "GDELT Project" plus each article's linked publisher/domain |
 | **GDELT Project 2.0 Event Database** | Political Events layer — CAMEO-coded political interactions (conflict, unrest, coercion, dissent, diplomacy) | [GDELT Terms of Use](https://www.gdeltproject.org/about.html#termsofuse): unrestricted academic/commercial/governmental dataset use, with citation and link required; linked articles retain publisher terms | "GDELT Project" plus each article's linked publisher/domain |
 | **City of Austin Open Data** | CCTV camera catalog + frames | City of Austin Open Data Terms of Use | "City of Austin, TX — data.austintexas.gov" |
 | **Caltrans (cwwp2.dot.ca.gov)** | CCTV camera catalogs + frames, California districts | Public Caltrans traffic camera data | "Caltrans — cwwp2.dot.ca.gov" (courtesy) |
@@ -123,6 +124,31 @@ How to read this:
   days or years, so a record carries its ingest time and its coded event date
   separately and is never presented as "happening now" on the strength of the
   former.
+
+  **Named entities on the hover card, and what they are not.** With
+  `GDELT_GKG_ENABLED=1`, pointing at a marker names the people and
+  organizations GDELT extracted from that article, in place of the category
+  description. Two limits are inherent to the source and are not bugs to be
+  fixed here:
+
+  - **The extractor does not distinguish fiction from reporting.** A comics
+    article yields `Parliament of Trees` and `Justice League Unlimited` as
+    *organizations*, rendered exactly like a real one. Nothing in the export or
+    the GKG reliably marks entertainment coverage — there is no genre field,
+    and the GKG's theme codes do not separate it dependably — so no filter is
+    applied rather than a filter that half-works. **Entity names are what an
+    article mentioned, not a claim that the entity exists or was involved.**
+  - **Entities are per ARTICLE, not per event.** One article commonly places
+    events at several locations, so those markers carry identical names. The
+    card says so explicitly ("Same report as …") rather than leaving the
+    repetition to look like a rendering fault.
+
+  The GKG is fetched **lazily per 15-minute slice, only when a viewer points at
+  a marker from it**, and is off by default: a GKG slice is 5.3 MB against the
+  export's 67 KB, so enriching unconditionally would cost ~512 MB/day against
+  6.5 MB. The file is flat and unindexed, so one article's row cannot be read
+  without downloading all of it. No headline is available from either file —
+  the GKG has 27 columns and none is a title.
 
   Marker size encodes a **CAMEO intensity index** combining CAMEO's Goldstein
   conflict/cooperation scale, article volume, and a declared per-category

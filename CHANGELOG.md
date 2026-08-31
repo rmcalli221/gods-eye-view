@@ -7,6 +7,20 @@ of current runtime behavior, see [`docs/CURRENT-STATE.md`](docs/CURRENT-STATE.md
 
 ### Added
 
+- The Political Events hover card can now name the people and organizations in
+  an article, from GDELT's GKG, replacing a category description that was
+  identical for every event in its category. Off by default
+  (`GDELT_GKG_ENABLED`): a GKG slice is 5.3 MB against the export's 67 KB, so
+  enabling it unconditionally would cost roughly 512 MB/day rather than 6.5 MB.
+  Even enabled, the fetch is lazy per 15-minute slice and happens only when
+  someone points at a marker from that slice. Entity names are extracted from
+  article text and are not verified — the extractor does not distinguish
+  fiction from reporting, so a comics article contributes fictional
+  organizations. Neither GDELT file carries an article headline.
+- Where one article placed events at several locations, the card names the
+  sibling places, so the identical entity text those markers necessarily share
+  reads as a shared report rather than as a bug.
+
 - Political Events markers now respond to hover: the marker enlarges and a card
   appears above it with the category and its description, place, source domain,
   coverage count, and a badge when the event is dated before GDELT ingested it.

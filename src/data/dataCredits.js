@@ -115,7 +115,8 @@ export const DATA_CREDITS = [
       '<a href="https://www.gdeltproject.org/about.html" target="_blank" rel="noopener">GDELT Project</a> ' +
       '2.0 Event Database &mdash; political interactions at city centroids, ' +
       'not verified incidents; no disaster, humanitarian or market coverage; ' +
-      'linked articles retain publisher terms',
+      'card entity names from the GDELT GKG are extracted from article text ' +
+      'and include fictional entities; linked articles retain publisher terms',
   },
   {
     key: 'austin-cctv',

@@ -1617,9 +1617,22 @@ rather than a severity, casualty, or damage assessment. The layer therefore
 implements no `getDetectableObjects()` and feeds no detection surface.
 
 Pointing at a marker enlarges it and raises a canvas-drawn hover card on the
-world overlay's `card` lane (no DOM, no InfoBox) carrying category, the
-category's own description, place, source domain, coverage count, and a badge
-when GDELT coded the event to a date before it ingested the row. A single click
+world overlay's `card` lane (no DOM, no InfoBox) carrying category, place,
+source domain, coverage count, a badge when GDELT coded the event to a date
+before it ingested the row, and — where one article placed events at several
+locations — the sibling places, so identical entity text across distant markers
+reads as the shared report it is rather than as a rendering fault.
+
+With `GDELT_GKG_ENABLED=1` the card names the people and organizations GDELT
+extracted from the article, in place of the category description (which is
+identical for every event in its category). Those names are unverified and
+include fictional entities: the extractor does not distinguish a comics article
+from reporting. The GKG is fetched lazily per 15-minute slice, triggered only
+by pointing at a marker from that slice and cached with it — a slice is 5.3 MB
+against the export's 67 KB, so unconditional enrichment would cost ~512 MB/day.
+Neither file carries a headline; the GKG has 27 columns and none is a title.
+Enrichment is strictly additive — disabled, failing, or empty, the card falls
+back to the category description. A single click
 opens the source article — guarded by drag discrimination, so a click that ends
 a camera drag over a marker opens nothing. That guard is what replaced the
 earlier two-stage click, not a relaxation of it. The hover pick is throttled to

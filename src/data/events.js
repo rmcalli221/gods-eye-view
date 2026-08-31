@@ -69,6 +69,7 @@ import {
  */
 
 const API_URL = '/api/events';
+const ENTITIES_URL = '/api/events/entities';
 
 export const EVENTS_OVERLAY_SOURCE_ID = 'events';
 export const EVENTS_OVERLAY_COHORT_LIMIT = 48;
@@ -388,10 +389,11 @@ export function eventHoverCardLines(record, { entities = null } = {}) {
  * @param {object} record Render record.
  * @param {Cesium.Cartesian3} position Ground anchor.
  * @param {Cesium.Cartesian3} cullPosition Lifted occlusion anchor.
+ * @param {?object} [entities] Parsed GKG entities for this article, when loaded.
  * @returns {object} Overlay entry.
  */
-export function createEventHoverCardEntry(record, position, cullPosition) {
-  const { title, details } = eventHoverCardLines(record);
+export function createEventHoverCardEntry(record, position, cullPosition, entities = null) {
+  const { title, details } = eventHoverCardLines(record, { entities });
   return {
     id: `${record.id}:card`,
     position,
@@ -495,6 +497,17 @@ export function createEventsLayer({
   let _hoverTrailingTimer = 0;
   /** Ambient label entries from the last render, republished on hover change. */
   let _labelEntries = [];
+  /**
+   * GKG entities by slice key, then by article URL. Populated lazily, only for
+   * slices a viewer has actually pointed into — a GKG slice costs 79x the
+   * export, so this must never be fetched speculatively.
+   * @type {Map<string, Map<string, object>>}
+   */
+  const _entitiesBySlice = new Map();
+  /** Slices with a request in flight, so a hover burst asks only once. */
+  const _entitiesInflight = new Set();
+  /** Slices whose enrichment is unavailable; never retried for this session. */
+  const _entitiesUnavailable = new Set();
   /** Last camera position the horizon pass ran against, for the skip check. */
   let _lastCullCameraPosition = null;
   /**
@@ -663,6 +676,46 @@ export function createEventsLayer({
     );
   }
 
+  /** Entities for one record's article, if its slice has been loaded. */
+  function entitiesFor(record) {
+    const slice = _entitiesBySlice.get(String(record?.slice || ''));
+    return slice ? slice.get(record.url) || null : null;
+  }
+
+  /**
+   * Ask the proxy for one slice's entities, at most once.
+   *
+   * Fire-and-forget: the card renders immediately from what it already has and
+   * gains the entity lines when they land, because a hover card that waits on
+   * a 5.3 MB upstream fetch is worse than one that never had entities. A slice
+   * that comes back empty or disabled is remembered as unavailable so a hover
+   * burst does not re-ask on every pass.
+   */
+  function requestEntities(sliceKey) {
+    const key = String(sliceKey || '');
+    if (!key || _entitiesBySlice.has(key) || _entitiesInflight.has(key)
+      || _entitiesUnavailable.has(key)) return;
+    _entitiesInflight.add(key);
+    fetch(`${ENTITIES_URL}?slice=${encodeURIComponent(key)}`)
+      .then((response) => (response.ok ? response.json() : null))
+      .then((payload) => {
+        if (!payload || payload.enabled === false || !payload.entities) {
+          _entitiesUnavailable.add(key);
+          return;
+        }
+        _entitiesBySlice.set(key, new Map(Object.entries(payload.entities)));
+        // Only repaint if the pointer is still on a marker from this slice —
+        // otherwise the answer arrived too late to be what anyone is looking at.
+        const hovered = _hoverId ? _renderedById.get(_hoverId) : null;
+        if (hovered && String(hovered.slice) === key) {
+          publishOverlay();
+          governorRequestRender('events-entities');
+        }
+      })
+      .catch(() => { _entitiesUnavailable.add(key); })
+      .finally(() => { _entitiesInflight.delete(key); });
+  }
+
   /** Overlay entry for the hovered record's card, or null when none. */
   function hoverCardEntry() {
     if (!_hoverId) return null;
@@ -676,6 +729,7 @@ export function createEventsLayer({
       record,
       Cesium.Cartesian3.fromDegrees(record.lon, record.lat),
       _cullTargets.cullPositions[index],
+      entitiesFor(record),
     );
   }
 
@@ -709,7 +763,11 @@ export function createEventsLayer({
     if (_hoverId === id) return;
     if (_hoverId) setHoverStyle(_hoverId, false);
     _hoverId = id;
-    if (_hoverId) setHoverStyle(_hoverId, true);
+    if (_hoverId) {
+      setHoverStyle(_hoverId, true);
+      // Pointing at a marker is the ONLY thing that triggers a GKG fetch.
+      requestEntities(_renderedById.get(_hoverId)?.slice);
+    }
     publishOverlay();
     governorRequestRender('events-hover');
   }
@@ -957,6 +1015,9 @@ export function createEventsLayer({
       _hoverId = null;
       _pointerDownAt = null;
       _labelEntries = [];
+      _entitiesBySlice.clear();
+      _entitiesInflight.clear();
+      _entitiesUnavailable.clear();
       unregisterPickOwner('events');
       if (_selectedId) {
         _selectedId = null;
@@ -1054,6 +1115,9 @@ export function createEventsLayer({
       _hoverId = null;
       _pointerDownAt = null;
       _labelEntries = [];
+      _entitiesBySlice.clear();
+      _entitiesInflight.clear();
+      _entitiesUnavailable.clear();
       unregisterPickOwner('events');
       try {
         clearSelectedEntityContextForLayer('events');
