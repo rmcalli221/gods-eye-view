@@ -20,6 +20,7 @@ import { governorRequestRender } from '../renderGovernor.js';
 import {
   EVENT_CATEGORIES,
   EVENT_SEVERITY_MODEL,
+  eventCategory,
   eventMarkerPixelSize,
   normalizeEventCategories,
   selectEventsForRender,
@@ -92,6 +93,29 @@ export const EVENTS_UPDATE_INTERVAL_MS = 10 * 60_000;
  * the identical height-0 case for aggregated heat cells).
  */
 export const EVENTS_CULL_LIFT_M = 12;
+/**
+ * Throttle for the horizon pass while the camera is in motion, in ms.
+ *
+ * The pass itself is not the cost — measured at 0.025 ms for 300 entities,
+ * about 0.15% of a frame — so this is a courtesy bound rather than a budget.
+ * 120 ms matches the CCTV hover throttle and keeps the far side clearing
+ * visibly during a drag without running on every single frame.
+ */
+export const EVENTS_MOVING_CULL_THROTTLE_MS = 120;
+/** Throttle for the hover pick pass, in ms. Matches the CCTV hover throttle. */
+export const EVENTS_HOVER_THROTTLE_MS = 120;
+/**
+ * How far the pointer may travel between press and release and still count as
+ * a click rather than a drag, in CSS pixels.
+ *
+ * This is the safeguard that replaces the old two-stage click. Opening a tab on
+ * a single click is only safe if a click that ENDED A CAMERA DRAG cannot
+ * trigger it — dragging the globe frequently finishes with the pointer over
+ * some marker, and without this every such drag would open an article.
+ */
+export const EVENTS_CLICK_DRAG_TOLERANCE_PX = 5;
+/** Longest line rendered on the hover card before truncation. */
+const CARD_LINE_CHARS = 46;
 
 const DEFAULT_OVERLAY_HOST = Object.freeze({
   setEntries: setOverlayEntries,
@@ -174,22 +198,130 @@ export function eventLabelText(record) {
 }
 
 /**
- * Whether a click on an already-selected record should open its source.
+ * Whether a pointer press/release pair is a drag rather than a click.
  *
- * Click-through is deliberately TWO-STAGE: the first click selects, a second
- * click on the same record opens the article. Cesium's InfoBox is disabled
- * (`infoBox: false` in src/main.js) and the world overlay is canvas-drawn, so
- * there is no DOM surface that could hold a real anchor; a single click that
- * opened a tab would fire on any stray globe click during camera work.
+ * Pure and unit-testable. A missing endpoint counts as a drag: if we cannot
+ * prove the pointer stayed put we must not open a tab.
  *
- * @param {?string} selectedId Currently selected record id.
- * @param {object} record Record just picked.
- * @returns {boolean} True when the pick should open the source URL.
+ * @param {?{x: number, y: number}} down Press position, canvas pixels.
+ * @param {?{x: number, y: number}} up Release position, canvas pixels.
+ * @param {object} [options]
+ * @param {number} [options.tolerancePx=EVENTS_CLICK_DRAG_TOLERANCE_PX] Slop.
+ * @returns {boolean} True when the gesture should NOT open anything.
  */
-export function shouldOpenEventSource(selectedId, record) {
-  if (!record || !selectedId) return false;
-  if (selectedId !== record.id) return false;
+export function isDragGesture(down, up, { tolerancePx = EVENTS_CLICK_DRAG_TOLERANCE_PX } = {}) {
+  if (!down || !up) return true;
+  const dx = Number(up.x) - Number(down.x);
+  const dy = Number(up.y) - Number(down.y);
+  if (!Number.isFinite(dx) || !Number.isFinite(dy)) return true;
+  return Math.hypot(dx, dy) > tolerancePx;
+}
+
+/**
+ * Whether a completed click should open the record's source.
+ *
+ * Single-click-to-open, guarded by drag discrimination. The layer previously
+ * required two clicks (select, then open) for exactly one reason: Cesium's
+ * InfoBox is disabled (`infoBox: false` in src/main.js) and the world overlay
+ * is canvas-drawn, so there is no DOM anchor, and a naive single click would
+ * fire on any stray globe click during camera work. That hazard is real and
+ * has NOT gone away — it is now handled by `isDragGesture` instead of by
+ * making every user click twice.
+ *
+ * @param {?object} record Record under the pointer.
+ * @param {object} [gesture]
+ * @param {boolean} [gesture.dragged=false] Whether the click ended a drag.
+ * @returns {boolean} True when the click should open the source URL.
+ */
+export function shouldOpenEventSource(record, { dragged = false } = {}) {
+  if (!record || dragged) return false;
   return Boolean(record.url);
+}
+
+/** Truncate one card line without breaking mid-escape. */
+function clampCardLine(value) {
+  const text = String(value ?? '').replace(/\s+/g, ' ').trim();
+  return text.length > CARD_LINE_CHARS ? `${text.slice(0, CARD_LINE_CHARS - 1)}…` : text;
+}
+
+/**
+ * Hover-card copy for one record.
+ *
+ * WHAT THIS DELIBERATELY DOES NOT SHOW. The export carries no article
+ * headline, and the obvious substitute — an "Actor1 → Actor2" summary — does
+ * not survive contact with the data: across the fixture Actor1Name is filled
+ * on 86% of rows, Actor2Name on 58%, and BOTH on only 44%, and where present
+ * they are frequently generic roles rather than named parties (`SCHOOL`,
+ * `POLICE`, `IMAM`, `FIREFIGHTER`) with Actor1 blank. A pair line would read as
+ * nonsense on most markers.
+ *
+ * A CAMEO leaf-code verb ("Arrest or detain") would be the informative
+ * addition, but no cleanly-licensed machine-readable code→label table could be
+ * found: the two community tables carry NO license at all, and the one MIT
+ * repository ships a verb-pattern dictionary rather than a label map. So the
+ * card describes the event through the category taxonomy this repo already
+ * owns and phrases itself. See `docs/PHASE1-DECISIONS.md` §14.
+ *
+ * @param {object} record Render record.
+ * @returns {{title: string, details: Array<string>}} Card copy.
+ */
+export function eventHoverCardLines(record) {
+  const spec = eventCategory(record?.category);
+  const details = [];
+  const severity = Number(record?.severity);
+  const label = spec?.label || String(record?.category || '').toUpperCase();
+  details.push(clampCardLine(
+    Number.isFinite(severity) ? `${label} · intensity ${severity}` : label,
+  ));
+  if (spec?.blurb) details.push(clampCardLine(spec.blurb));
+
+  const reports = Number(record?.numArticles);
+  const domain = String(record?.domain || '').trim();
+  const coverage = Number.isFinite(reports) && reports > 0
+    ? `${reports} report${reports === 1 ? '' : 's'}`
+    : '';
+  const sourceLine = [domain, coverage].filter(Boolean).join(' · ');
+  if (sourceLine) details.push(clampCardLine(sourceLine));
+
+  // A marker for something GDELT coded to a date well before it ingested the
+  // row must not read as "happening now".
+  const retro = Number(record?.retrospectiveDays);
+  if (Number.isFinite(retro) && retro > 0) {
+    details.push(clampCardLine(`Event dated ${retro} day${retro === 1 ? '' : 's'} earlier`));
+  }
+  return { title: clampCardLine(eventLabelText(record)), details };
+}
+
+/**
+ * Build the hover card overlay entry for one record.
+ * @param {object} record Render record.
+ * @param {Cesium.Cartesian3} position Ground anchor.
+ * @param {Cesium.Cartesian3} cullPosition Lifted occlusion anchor.
+ * @returns {object} Overlay entry.
+ */
+export function createEventHoverCardEntry(record, position, cullPosition) {
+  const { title, details } = eventHoverCardLines(record);
+  return {
+    id: `${record.id}:card`,
+    position,
+    cullPosition: cullPosition || position,
+    variant: 'card',
+    title,
+    details,
+    accent: record.color,
+    // Above every ambient label, so the card a pointer is resting on is never
+    // decluttered away by a neighbour.
+    priority: Number.MAX_SAFE_INTEGER,
+    collisionGroup: 'ambient-card',
+    paintLane: 'ambient-card',
+    interactive: false,
+    edgeFade: 'keyhole',
+    horizonCull: true,
+    terrainOcclusion: false,
+    gapPx: 18,
+    verticalOnly: true,
+    placement: 'above',
+  };
 }
 
 /**
@@ -252,6 +384,26 @@ export function createEventsLayer({
   let _rowControlsListener = null;
   /** camera.moveEnd handle for the horizon pass; removed on disable/destroy. */
   let _horizonCullListener = null;
+  /** camera.moveStart handle: opens the in-motion window. */
+  let _moveStartListener = null;
+  /** scene.postRender disposer, held ONLY while the camera is in motion. */
+  let _movingRenderListener = null;
+  /** Timestamp of the last in-motion pass, for the throttle. */
+  let _lastMovingCullAt = 0;
+  /** True between moveStart and moveEnd; hover picking pauses while set. */
+  let _cameraMoving = false;
+  /** Record id under the pointer, or null. */
+  let _hoverId = null;
+  /** Canvas position of the last LEFT_DOWN, for drag discrimination. */
+  let _pointerDownAt = null;
+  /** Timestamp of the last hover pick, for the throttle. */
+  let _lastHoverPickAt = 0;
+  /** Latest pointer position awaiting the throttle's trailing edge. */
+  let _hoverPending = null;
+  /** Trailing-edge timer handle. */
+  let _hoverTrailingTimer = 0;
+  /** Ambient label entries from the last render, republished on hover change. */
+  let _labelEntries = [];
   /** Last camera position the horizon pass ran against, for the skip check. */
   let _lastCullCameraPosition = null;
   /**
@@ -343,17 +495,9 @@ export function createEventsLayer({
     }
 
     _count = selected.length;
-    if (_enabled) {
-      overlayHost.setEntries(
-        EVENTS_OVERLAY_SOURCE_ID,
-        selectEventOverlayCohort(overlayEntries),
-        {
-          cohortLimit: EVENTS_OVERLAY_COHORT_LIMIT,
-          collisionCapacity: EVENTS_OVERLAY_COLLISION_CAPACITY,
-          moving: false,
-        },
-      );
-    }
+    _labelEntries = overlayEntries;
+    if (_hoverId && !_renderedById.has(_hoverId)) _hoverId = null;
+    publishOverlay();
     if (_selectedId && !_renderedById.has(_selectedId)) _selectedId = null;
     // A rebuild produces entities defaulting to show=true, so the pass must run
     // before the next frame or a poll would flash far-side markers for a tick.
@@ -404,6 +548,81 @@ export function createEventsLayer({
     if (visible !== before) governorRequestRender('events-horizon');
   }
 
+  /**
+   * Publish the ambient label cohort, plus the hover card when one is up.
+   *
+   * The hovered record's own LABEL is dropped while its card is showing — the
+   * card already carries the place name, and leaving both would stack two
+   * copies of it over the same marker.
+   */
+  function publishOverlay() {
+    if (!_enabled) return;
+    const cohort = selectEventOverlayCohort(
+      _hoverId ? _labelEntries.filter((entry) => entry.id !== _hoverId) : _labelEntries,
+    );
+    const card = hoverCardEntry();
+    overlayHost.setEntries(
+      EVENTS_OVERLAY_SOURCE_ID,
+      card ? [...cohort, card] : cohort,
+      {
+        cohortLimit: EVENTS_OVERLAY_COHORT_LIMIT,
+        collisionCapacity: EVENTS_OVERLAY_COLLISION_CAPACITY,
+        moving: _cameraMoving,
+      },
+    );
+  }
+
+  /** Overlay entry for the hovered record's card, or null when none. */
+  function hoverCardEntry() {
+    if (!_hoverId) return null;
+    const record = _renderedById.get(_hoverId);
+    if (!record) return null;
+    const index = _cullTargets.entities.findIndex((entity) => entity.id === _hoverId);
+    if (index < 0) return null;
+    // A card over a marker the planet is hiding would float in empty space.
+    if (_cullTargets.entities[index].show === false) return null;
+    return createEventHoverCardEntry(
+      record,
+      Cesium.Cartesian3.fromDegrees(record.lon, record.lat),
+      _cullTargets.cullPositions[index],
+    );
+  }
+
+  /** Pick at a pointer position and move the hover to whatever is under it. */
+  function runHoverPick(viewer, endPosition) {
+    _lastHoverPickAt = Date.now();
+    const picked = viewer?.scene?.pick?.(endPosition);
+    const record = pickedRecord(picked);
+    setHover(record ? record.id : null);
+  }
+
+  /** Cancel any queued trailing hover pick. */
+  function clearHoverTrailing() {
+    if (_hoverTrailingTimer) clearTimeout(_hoverTrailingTimer);
+    _hoverTrailingTimer = 0;
+    _hoverPending = null;
+  }
+
+  /** Grow the hovered marker so the pointer target is unambiguous. */
+  function setHoverStyle(id, hovered) {
+    const record = _renderedById.get(id);
+    const entity = _dataSource?.entities?.getById?.(id);
+    if (!record || !entity?.point) return;
+    const base = eventMarkerPixelSize(record);
+    entity.point.pixelSize = hovered ? Math.round((base + 4) * 10) / 10 : base;
+    entity.point.outlineWidth = hovered ? 3 : (record.severity >= 60 ? 2 : 1);
+  }
+
+  /** Move the hover to `id` (or clear it), restyling and republishing once. */
+  function setHover(id) {
+    if (_hoverId === id) return;
+    if (_hoverId) setHoverStyle(_hoverId, false);
+    _hoverId = id;
+    if (_hoverId) setHoverStyle(_hoverId, true);
+    publishOverlay();
+    governorRequestRender('events-hover');
+  }
+
   /** Resolve a scene pick to one of this layer's rendered records, or null. */
   function pickedRecord(picked) {
     const pickId = resolvePickId(picked);
@@ -430,13 +649,17 @@ export function createEventsLayer({
         }
         return;
       }
-      // Two-stage: select first, open on a repeat click. See
-      // `shouldOpenEventSource`.
-      if (shouldOpenEventSource(_selectedId, record)) {
+      // Single click opens, UNLESS the click ended a camera drag. See
+      // `isDragGesture` — dropping that check would mean every globe drag that
+      // happens to finish over a marker opens an article.
+      const dragged = isDragGesture(_pointerDownAt, click.position);
+      _pointerDownAt = null;
+      if (shouldOpenEventSource(record, { dragged })) {
+        _selectedId = record.id;
         openArticle(record.url);
-        return;
+      } else {
+        _selectedId = record.id;
       }
-      _selectedId = record.id;
       // Context is registered ON SELECTION, not per rendered marker: a poll
       // renders up to EVENTS_MAX_ENTITIES of them every ten minutes and the
       // shared store has no eviction of its own, so registering all of them
@@ -462,21 +685,122 @@ export function createEventsLayer({
         }
       } catch { /* context store unavailable */ }
     }, Cesium.ScreenSpaceEventType.LEFT_CLICK);
+
+    // Press position, for drag discrimination on release.
+    _clickHandler.setInputAction((event) => {
+      _pointerDownAt = event?.position
+        ? { x: event.position.x, y: event.position.y }
+        : null;
+    }, Cesium.ScreenSpaceEventType.LEFT_DOWN);
+
+    // Hover. Throttled, and skipped entirely while the camera is in motion:
+    // picking every frame of a drag is expensive and the result is discarded
+    // the moment the camera moves again.
+    //
+    // The throttle has a TRAILING EDGE, which is not decoration. A
+    // leading-edge-only throttle drops the last move of a gesture, so flicking
+    // the pointer off a marker and stopping within the window leaves the card
+    // and the enlarged marker stuck under a pointer that is no longer there.
+    _clickHandler.setInputAction((movement) => {
+      if (!_enabled || _cameraMoving) return;
+      const endPosition = movement?.endPosition;
+      if (!endPosition) return;
+      const wait = EVENTS_HOVER_THROTTLE_MS - (Date.now() - _lastHoverPickAt);
+      if (wait > 0) {
+        _hoverPending = { x: endPosition.x, y: endPosition.y };
+        if (!_hoverTrailingTimer) {
+          _hoverTrailingTimer = setTimeout(() => {
+            _hoverTrailingTimer = 0;
+            const pending = _hoverPending;
+            _hoverPending = null;
+            if (pending && _enabled && !_cameraMoving) runHoverPick(viewer, pending);
+          }, wait);
+        }
+        return;
+      }
+      runHoverPick(viewer, endPosition);
+    }, Cesium.ScreenSpaceEventType.MOUSE_MOVE);
+  }
+
+  /**
+   * Run the horizon pass while the camera is in motion, throttled.
+   *
+   * Subscribed to `scene.postRender` ONLY between `moveStart` and `moveEnd`.
+   * That choice is the whole design:
+   *
+   * - It costs no extra frames. A drag, a zoom and the inertia that follows are
+   *   already producing frames; this rides them. When the camera is parked the
+   *   scene renders nothing, so the subscription is removed and the cost is
+   *   exactly zero — the layer still takes NO continuous-render hold.
+   * - It covers inertia. `moveEnd` fires only once the glide has fully settled,
+   *   which after a zoom is a noticeable wait with far-side markers still up.
+   * - It does not touch `camera.percentageChanged`. `camera.changed` would be
+   *   the obvious alternative, but that threshold is a SHARED GLOBAL on the
+   *   camera — `traffic.js` sets it to 0.05 and restores it on disable
+   *   precisely because leaving it mutated affects every other listener in the
+   *   app. Two layers negotiating one global is a bug waiting to happen.
+   */
+  function installMovingCullPass() {
+    if (_movingRenderListener || !_viewer?.scene?.postRender?.addEventListener) return;
+    _lastMovingCullAt = 0;
+    _movingRenderListener = _viewer.scene.postRender.addEventListener(() => {
+      const now = Date.now();
+      if (now - _lastMovingCullAt < EVENTS_MOVING_CULL_THROTTLE_MS) return;
+      _lastMovingCullAt = now;
+      applyEventHorizonCull();
+    });
+  }
+
+  function removeMovingCullPass() {
+    if (!_movingRenderListener) return;
+    try {
+      _movingRenderListener();
+    } catch { /* scene already torn down */ }
+    _movingRenderListener = null;
   }
 
   function installHorizonCullListener(viewer) {
-    if (_horizonCullListener || !viewer?.camera?.moveEnd?.addEventListener) return;
-    _horizonCullListener = () => applyEventHorizonCull();
-    viewer.camera.moveEnd.addEventListener(_horizonCullListener);
+    const camera = viewer?.camera;
+    if (!camera?.moveEnd?.addEventListener) return;
+    if (!_moveStartListener && camera.moveStart?.addEventListener) {
+      _moveStartListener = () => {
+        _cameraMoving = true;
+        clearHoverTrailing();
+        // A card anchored to a marker that is about to slide across the screen
+        // reads as lag; drop it for the duration of the movement.
+        if (_hoverId) setHover(null);
+        installMovingCullPass();
+      };
+      camera.moveStart.addEventListener(_moveStartListener);
+    }
+    if (_horizonCullListener) return;
+    _horizonCullListener = () => {
+      // Close the in-motion window first, then take the settled reading.
+      _cameraMoving = false;
+      removeMovingCullPass();
+      applyEventHorizonCull();
+    };
+    camera.moveEnd.addEventListener(_horizonCullListener);
   }
 
   function removeHorizonCullListener() {
-    if (!_horizonCullListener) return;
-    try {
-      (_viewer?.camera?.moveEnd?.removeEventListener)?.(_horizonCullListener);
-    } catch { /* camera already torn down */ }
-    _horizonCullListener = null;
+    removeMovingCullPass();
+    const camera = _viewer?.camera;
+    if (_moveStartListener) {
+      try {
+        camera?.moveStart?.removeEventListener?.(_moveStartListener);
+      } catch { /* camera already torn down */ }
+      _moveStartListener = null;
+    }
+    if (_horizonCullListener) {
+      try {
+        camera?.moveEnd?.removeEventListener?.(_horizonCullListener);
+      } catch { /* camera already torn down */ }
+      _horizonCullListener = null;
+    }
     _lastCullCameraPosition = null;
+    _lastMovingCullAt = 0;
+    _cameraMoving = false;
   }
 
   function removeClickHandler() {
@@ -512,6 +836,9 @@ export function createEventsLayer({
       _enabled = false;
       _loading = false;
       _selectedId = null;
+      _hoverId = null;
+      _pointerDownAt = null;
+      _labelEntries = [];
       _records = [];
       _renderedById.clear();
       overlayHost.setVisible(EVENTS_OVERLAY_SOURCE_ID, false);
@@ -535,6 +862,10 @@ export function createEventsLayer({
       abortInflight('events layer disabled');
       removeClickHandler();
       removeHorizonCullListener();
+      clearHoverTrailing();
+      _hoverId = null;
+      _pointerDownAt = null;
+      _labelEntries = [];
       unregisterPickOwner('events');
       if (_selectedId) {
         _selectedId = null;
@@ -628,6 +959,10 @@ export function createEventsLayer({
       abortInflight('events layer destroyed');
       removeClickHandler();
       removeHorizonCullListener();
+      clearHoverTrailing();
+      _hoverId = null;
+      _pointerDownAt = null;
+      _labelEntries = [];
       unregisterPickOwner('events');
       try {
         clearSelectedEntityContextForLayer('events');

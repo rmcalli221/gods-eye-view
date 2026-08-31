@@ -1614,12 +1614,27 @@ positions. Only city-precision rows are plotted; country and state centroids
 are dropped rather than drawn as points. Marker size encodes a CAMEO intensity
 index (Goldstein scale x article volume x a declared per-category weight)
 rather than a severity, casualty, or damage assessment. The layer therefore
-implements no `getDetectableObjects()` and feeds no detection surface. Clicking
-a marker selects it; clicking the selected marker again opens its source
-article in a new tab.
+implements no `getDetectableObjects()` and feeds no detection surface.
+
+Pointing at a marker enlarges it and raises a canvas-drawn hover card on the
+world overlay's `card` lane (no DOM, no InfoBox) carrying category, the
+category's own description, place, source domain, coverage count, and a badge
+when GDELT coded the event to a date before it ingested the row. A single click
+opens the source article — guarded by drag discrimination, so a click that ends
+a camera drag over a marker opens nothing. That guard is what replaced the
+earlier two-stage click, not a relaxation of it. The hover pick is throttled to
+120 ms with a trailing edge (without one, flicking off a marker and stopping
+leaves the card stuck) and pauses entirely while the camera is in motion.
 
 Markers are horizon-culled against an `EllipsoidalOccluder` on `camera.moveEnd`
-— never per frame, so the layer still takes no continuous-render hold. This is
+and, while the camera is in motion, on a 120 ms-throttled `scene.postRender`
+pass bracketed by `moveStart`/`moveEnd` — so the far side clears during a drag
+and through inertia rather than only once the camera settles. The subscription
+exists only while moving, and a parked camera renders no frames, so the layer
+still takes no continuous-render hold. `camera.changed` was rejected for this:
+its `percentageChanged` threshold is a shared global that `traffic.js` already
+sets and restores, and two layers negotiating one value is a bug waiting to
+happen. This is
 required, not an optimisation: the markers set
 `disableDepthTestDistance: Number.POSITIVE_INFINITY` so a marker is never
 swallowed by the terrain it stands on, which also means nothing occludes them

@@ -11,14 +11,19 @@ import { fileURLToPath } from 'node:url';
 import path from 'node:path';
 import * as Cesium from 'cesium';
 import {
+  EVENTS_CLICK_DRAG_TOLERANCE_PX,
   EVENTS_CULL_LIFT_M,
+  EVENTS_HOVER_THROTTLE_MS,
   EVENTS_MAX_ENTITIES,
   EVENTS_OVERLAY_COHORT_LIMIT,
   EVENTS_OVERLAY_COLLISION_CAPACITY,
   createEventOverlayEntry,
   createEventsLayer,
+  createEventHoverCardEntry,
   eventCullPosition,
+  eventHoverCardLines,
   eventLabelText,
+  isDragGesture,
   mapAnalystRecord,
   selectEventOverlayCohort,
   shouldOpenEventSource,
@@ -58,21 +63,28 @@ function proxyPayload({ stale = false, sliceCount = 16, events = FIXTURE_EVENTS 
  * every test around it is a false green.
  */
 function fakeCamera(lon = -97.7, lat = 30.2, height = 25_000_000) {
-  const listeners = [];
+  const moveStartListeners = [];
+  const moveEndListeners = [];
+  const event = (list) => ({
+    addEventListener: (fn) => { list.push(fn); },
+    removeEventListener: (fn) => {
+      const i = list.indexOf(fn);
+      if (i >= 0) list.splice(i, 1);
+    },
+  });
   return {
     positionWC: Cesium.Cartesian3.fromDegrees(lon, lat, height),
-    moveEnd: {
-      addEventListener: (fn) => { listeners.push(fn); },
-      removeEventListener: (fn) => {
-        const i = listeners.indexOf(fn);
-        if (i >= 0) listeners.splice(i, 1);
-      },
-    },
-    listeners,
-    /** Move the camera and fire moveEnd, the way Cesium would. */
+    moveStart: event(moveStartListeners),
+    moveEnd: event(moveEndListeners),
+    moveStartListeners,
+    moveEndListeners,
+    /** Every camera subscription this layer holds. */
+    get listeners() { return [...moveStartListeners, ...moveEndListeners]; },
+    /** Move the camera and fire the full start/settle cycle, as Cesium would. */
     flyTo(nextLon, nextLat, nextHeight = height) {
+      for (const fn of [...moveStartListeners]) fn();
       this.positionWC = Cesium.Cartesian3.fromDegrees(nextLon, nextLat, nextHeight);
-      for (const fn of [...listeners]) fn();
+      for (const fn of [...moveEndListeners]) fn();
     },
   };
 }
@@ -85,6 +97,20 @@ function fakeViewer({ pickResult = null, camera = fakeCamera() } = {}) {
     scene: {
       canvas: { id: 'canvas' },
       pick: () => pickResult,
+      postRender: {
+        listeners: [],
+        addEventListener(fn) {
+          this.listeners.push(fn);
+          return () => {
+            const i = this.listeners.indexOf(fn);
+            if (i >= 0) this.listeners.splice(i, 1);
+          };
+        },
+      },
+      /** Drive N frames, the way a drag would. */
+      _renderFrames(n = 1) {
+        for (let i = 0; i < n; i += 1) for (const fn of [...this.postRender.listeners]) fn();
+      },
     },
     _setPick(next) { this.scene.pick = () => next; },
     dataSourcesApi: {
@@ -120,6 +146,13 @@ function recordingHost() {
     setEntries: (...args) => calls.push(['entries', ...args]),
     setVisible: (...args) => calls.push(['visible', ...args]),
     clearSource: (...args) => calls.push(['clear', ...args]),
+    /** Entries from the most recent publish, for overlay-content assertions. */
+    last() {
+      for (let i = calls.length - 1; i >= 0; i -= 1) {
+        if (calls[i][0] === 'entries') return calls[i][2] || [];
+      }
+      return [];
+    },
   };
 }
 
@@ -131,12 +164,36 @@ function recordingHost() {
 const NOOP_HANDLER_FACTORY = () => ({ setInputAction() {}, destroy() {} });
 
 /** Capture the LEFT_CLICK callback the layer installs. */
+/**
+ * ScreenSpaceEventHandler double. The layer registers three input actions now
+ * (click, press, hover), so they are keyed by Cesium's event type rather than
+ * collapsed into one slot.
+ */
 function clickHandlerFactory() {
-  const state = { action: null, destroyed: false };
+  const state = { action: null, byType: new Map(), destroyed: false };
+  const helpers = {
+    /** Press then release at the same point — an unambiguous click. */
+    click(position = { x: 1, y: 1 }) {
+      state.byType.get(Cesium.ScreenSpaceEventType.LEFT_DOWN)?.({ position });
+      state.byType.get(Cesium.ScreenSpaceEventType.LEFT_CLICK)?.({ position });
+    },
+    /** Press at one point, release at another — a camera drag. */
+    drag(from = { x: 1, y: 1 }, to = { x: 80, y: 60 }) {
+      state.byType.get(Cesium.ScreenSpaceEventType.LEFT_DOWN)?.({ position: from });
+      state.byType.get(Cesium.ScreenSpaceEventType.LEFT_CLICK)?.({ position: to });
+    },
+    hover(endPosition = { x: 1, y: 1 }) {
+      state.byType.get(Cesium.ScreenSpaceEventType.MOUSE_MOVE)?.({ endPosition });
+    },
+  };
   return {
     state,
+    helpers,
     factory: () => ({
-      setInputAction(action) { state.action = action; },
+      setInputAction(action, type) {
+        state.byType.set(type, action);
+        if (type === Cesium.ScreenSpaceEventType.LEFT_CLICK) state.action = action;
+      },
       destroy() { state.destroyed = true; },
     }),
   };
@@ -219,13 +276,28 @@ test('analyst record is JSON-safe with nulls instead of NaN or undefined', () =>
   }
 });
 
-test('click-through opens only on a repeat click of the selected record with a URL', () => {
+test('a single click opens, but only when the gesture was not a drag', () => {
   const record = { id: 'evt:1', url: 'https://example-news.org/a/1' };
-  assert.equal(shouldOpenEventSource(null, record), false, 'first click selects');
-  assert.equal(shouldOpenEventSource('evt:other', record), false);
-  assert.equal(shouldOpenEventSource('evt:1', record), true);
-  assert.equal(shouldOpenEventSource('evt:1', { id: 'evt:1' }), false);
-  assert.equal(shouldOpenEventSource('evt:1', null), false);
+  assert.equal(shouldOpenEventSource(record), true, 'one click is enough now');
+  assert.equal(shouldOpenEventSource(record, { dragged: true }), false);
+  assert.equal(shouldOpenEventSource({ id: 'evt:1' }), false, 'no URL, nothing to open');
+  assert.equal(shouldOpenEventSource(null), false);
+});
+
+test('drag discrimination: slop is a click, travel is a drag, unknown is a drag', () => {
+  const at = (x, y) => ({ x, y });
+  assert.equal(isDragGesture(at(10, 10), at(10, 10)), false, 'no movement');
+  assert.equal(isDragGesture(at(10, 10), at(13, 13)), false, 'inside tolerance (4.2 px)');
+  assert.equal(isDragGesture(at(10, 10), at(60, 40)), true, 'a real drag');
+  assert.equal(
+    isDragGesture(at(0, 0), at(EVENTS_CLICK_DRAG_TOLERANCE_PX + 1, 0)), true,
+    'just outside tolerance',
+  );
+  // Fail closed. If we cannot prove the pointer stayed put we must not open a
+  // tab — a missing press is exactly the ambiguous case.
+  assert.equal(isDragGesture(null, at(1, 1)), true);
+  assert.equal(isDragGesture(at(1, 1), null), true);
+  assert.equal(isDragGesture(at(NaN, 1), at(1, 1)), true);
 });
 
 // ── Lifecycle ───────────────────────────────────────────────────────────────
@@ -577,7 +649,7 @@ test('row controls expose one chip per category and refuse to disable the last o
 
 // ── Click-through ───────────────────────────────────────────────────────────
 
-test('first click selects, second click opens the source, and only then', async () => {
+test('one click opens the source; a click that ended a drag does not', async () => {
   const viewer = viewerWithSources();
   const clicks = clickHandlerFactory();
   const opened = [];
@@ -598,19 +670,25 @@ test('first click selects, second click opens the source, and only then', async 
     assert.ok(entity, 'the highest-ranked marker is rendered');
     viewer._setPick({ id: entity });
 
-    clicks.state.action({ position: { x: 1, y: 1 } });
-    assert.deepEqual(opened, [], 'the first click only selects');
+    // One click is all it takes now — no select-then-open dance.
+    clicks.helpers.click();
+    assert.deepEqual(opened, [TOP_EVENT.url], 'a single click opens the source');
 
-    clicks.state.action({ position: { x: 1, y: 1 } });
-    assert.deepEqual(opened, [TOP_EVENT.url], 'the second click opens the source');
+    // The safeguard the two-stage click used to provide, kept explicitly.
+    // Dragging the globe routinely finishes with the pointer over a marker,
+    // and that must never open an article.
+    clicks.helpers.drag({ x: 1, y: 1 }, { x: 90, y: 70 });
+    assert.equal(opened.length, 1, 'a click that ended a drag opens nothing');
 
-    // A click on empty space clears the selection, so the next click on the
-    // same marker selects again rather than opening.
+    // A release with no matching press cannot be proven stationary, so it is
+    // treated as a drag rather than trusted.
+    clicks.state.byType.get(Cesium.ScreenSpaceEventType.LEFT_CLICK)({ position: { x: 5, y: 5 } });
+    assert.equal(opened.length, 1, 'an unpaired release opens nothing');
+
+    // A click on empty space still clears the selection.
     viewer._setPick(null);
-    clicks.state.action({ position: { x: 2, y: 2 } });
-    viewer._setPick({ id: entity });
-    clicks.state.action({ position: { x: 1, y: 1 } });
-    assert.equal(opened.length, 1, 'selection was cleared, so this click re-selects');
+    clicks.helpers.click({ x: 2, y: 2 });
+    assert.equal(opened.length, 1);
 
     layer.disable(viewer);
     assert.equal(clicks.state.destroyed, true, 'disable destroys the click handler');
@@ -640,19 +718,14 @@ test('a pick owned by another layer is left alone, not treated as empty space', 
         .find((candidate) => candidate.id === TOP_EVENT.id);
 
       viewer._setPick({ id: entity });
-      clicks.state.action({ position: { x: 1, y: 1 } });
+      clicks.helpers.click();
+      assert.deepEqual(opened, [TOP_EVENT.url], 'our marker opened');
 
+      // A sibling layer's entity is not "empty space": it must not clear our
+      // selection, and it must not open anything of ours.
       viewer._setPick({ id: 'sibling-entity' });
-      clicks.state.action({ position: { x: 3, y: 3 } });
-      assert.deepEqual(opened, [], 'a sibling pick opens nothing');
-
-      viewer._setPick({ id: entity });
-      clicks.state.action({ position: { x: 1, y: 1 } });
-      assert.deepEqual(
-        opened,
-        [TOP_EVENT.url],
-        'the selection survived the sibling pick',
-      );
+      clicks.helpers.click({ x: 3, y: 3 });
+      assert.deepEqual(opened, [TOP_EVENT.url], 'a sibling pick opens nothing');
       layer.destroy(viewer);
     });
   } finally {
@@ -801,7 +874,10 @@ test('the pass recomputes when the camera moves, not per frame', async () => {
     layer.init(viewer);
     layer.enable(viewer);
     await layer.update(viewer, {});
-    assert.equal(camera.listeners.length, 1, 'exactly one moveEnd subscription');
+    assert.deepEqual(
+      [camera.moveStartListeners.length, camera.moveEndListeners.length], [1, 1],
+      'one moveStart and one moveEnd subscription',
+    );
 
     const byId = new Map(viewer.sources[0].entities.values.map((e) => [e.id, e]));
     assert.equal(byId.get('far').show, false);
@@ -897,12 +973,12 @@ test('teardown removes the camera subscription', async () => {
   });
   layer.init(viewer);
   layer.enable(viewer);
-  assert.equal(camera.listeners.length, 1);
+  assert.equal(camera.listeners.length, 2, 'moveStart and moveEnd');
   layer.disable(viewer);
-  assert.equal(camera.listeners.length, 0, 'disable unsubscribes');
+  assert.equal(camera.listeners.length, 0, 'disable unsubscribes both');
 
   layer.enable(viewer);
-  assert.equal(camera.listeners.length, 1, 'and re-enable resubscribes exactly once');
+  assert.equal(camera.listeners.length, 2, 'and re-enable resubscribes exactly once each');
   layer.destroy(viewer);
   assert.equal(camera.listeners.length, 0, 'destroy unsubscribes');
 });
@@ -921,6 +997,233 @@ test('overlay labels are culled against the lifted anchor, not the surface point
     id: 'y', position, title: 'Y', accent: '#fff', severity: 10,
   });
   assert.equal(bare.cullPosition, position);
+});
+
+
+// ── Hover, card, and in-motion culling ──────────────────────────────────────
+
+test('the hover card says what we actually have, and no actor pair', () => {
+  const record = {
+    id: '1', category: 'conflict', place: 'Kharkiv, Kharkivska, Ukraine',
+    severity: 87, numArticles: 10, domain: 'example-news.org', retrospectiveDays: 0,
+  };
+  const { title, details } = eventHoverCardLines(record);
+  assert.equal(title, 'Kharkiv');
+  assert.equal(details[0], 'CONFLICT · intensity 87');
+  assert.equal(details[1], 'Assault, fight, unconventional mass violence');
+  assert.equal(details[2], 'example-news.org · 10 reports');
+  assert.equal(details.length, 3, 'no retrospective line for a current event');
+
+  // The export carries no headline, and an Actor1 -> Actor2 line is filled on
+  // only 44% of rows and frequently generic where it is (SCHOOL, POLICE,
+  // IMAM), so the card must not attempt one.
+  const joined = [title, ...details].join(' ');
+  assert.ok(!joined.includes('->'), 'no actor-pair line');
+  assert.ok(!joined.includes('undefined') && !joined.includes('null'));
+
+  // A backdated event is badged rather than left to read as current.
+  const retro = eventHoverCardLines({ ...record, retrospectiveDays: 365 });
+  assert.equal(retro.details[3], 'Event dated 365 days earlier');
+  assert.equal(eventHoverCardLines({ ...record, retrospectiveDays: 1 }).details[3],
+    'Event dated 1 day earlier');
+});
+
+test('card copy degrades rather than printing blanks on a sparse record', () => {
+  const { title, details } = eventHoverCardLines({ id: 'x', category: 'unrest' });
+  assert.equal(title, 'EVENT');
+  assert.equal(details[0], 'UNREST', 'no severity, so no intensity suffix');
+  assert.equal(details[1], 'Protest');
+  assert.equal(details.length, 2, 'no source line without a domain or count');
+  for (const line of details) assert.ok(line.length > 0);
+});
+
+test('hovering a marker enlarges it and publishes a card', async () => {
+  const host = recordingHost();
+  const camera = fakeCamera(NORTH_AMERICA.lon, NORTH_AMERICA.lat, 12_000_000);
+  const viewer = viewerWithSources({ camera });
+  const clicks = clickHandlerFactory();
+  const layer = createEventsLayer({
+    overlayHost: host, screenSpaceEventHandlerFactory: clicks.factory,
+  });
+  const events = [eventAt('near', NORTH_AMERICA)];
+  await withFetch(async () => okResponse(proxyPayload({ events })), async () => {
+    layer.init(viewer);
+    layer.enable(viewer);
+    await layer.update(viewer, {});
+    const [entity] = viewer.sources[0].entities.values;
+    // Cesium wraps assigned primitives in a ConstantProperty, so read through
+    // getValue rather than comparing the property object.
+    const now = Cesium.JulianDate.now();
+    const sizeOf = (e) => e.point.pixelSize.getValue(now);
+    const outlineOf = (e) => e.point.outlineWidth.getValue(now);
+    const baseSize = sizeOf(entity);
+
+    viewer._setPick({ id: entity });
+    clicks.helpers.hover();
+    assert.ok(sizeOf(entity) > baseSize, 'the hovered marker grows');
+    assert.equal(outlineOf(entity), 3);
+
+    const card = host.last().find((e) => e.variant === 'card');
+    assert.ok(card, 'a card entry is published');
+    assert.equal(card.id, 'near:card');
+    assert.match(card.details[0], /^CONFLICT/);
+    assert.ok(card.cullPosition, 'the card is culled on the lifted anchor too');
+    // The card carries the place name, so its own label would be a duplicate.
+    assert.ok(!host.last().some((e) => e.id === 'near'), 'the label yields to the card');
+
+    // Moving off the marker and STOPPING lands inside the throttle window. A
+    // leading-edge-only throttle would drop that last move and leave the card
+    // stuck under a pointer that has gone; the trailing edge must deliver it.
+    viewer._setPick(null);
+    clicks.helpers.hover({ x: 9, y: 9 });
+    assert.equal(sizeOf(entity), baseSize + 4, 'still hovered inside the window');
+    await new Promise((resolve) => { setTimeout(resolve, EVENTS_HOVER_THROTTLE_MS + 40); });
+    assert.equal(sizeOf(entity), baseSize, 'the trailing edge restores the marker');
+    assert.ok(!host.last().some((e) => e.variant === 'card'), 'and drops the card');
+    layer.destroy(viewer);
+  });
+});
+
+test('a queued trailing hover never fires after teardown', async () => {
+  // The trailing timer outlives the gesture by design, so teardown must cancel
+  // it — otherwise it picks against a destroyed data source.
+  const camera = fakeCamera(NORTH_AMERICA.lon, NORTH_AMERICA.lat, 12_000_000);
+  const viewer = viewerWithSources({ camera });
+  const clicks = clickHandlerFactory();
+  const layer = createEventsLayer({
+    overlayHost: recordingHost(), screenSpaceEventHandlerFactory: clicks.factory,
+  });
+  const events = [eventAt('near', NORTH_AMERICA)];
+  await withFetch(async () => okResponse(proxyPayload({ events })), async () => {
+    layer.init(viewer);
+    layer.enable(viewer);
+    await layer.update(viewer, {});
+    clicks.helpers.hover({ x: 1, y: 1 });
+    clicks.helpers.hover({ x: 2, y: 2 });   // queues a trailing pick
+    layer.destroy(viewer);
+    let threw = null;
+    viewer.scene.pick = () => { threw = new Error('picked after destroy'); return null; };
+    await new Promise((resolve) => { setTimeout(resolve, EVENTS_HOVER_THROTTLE_MS + 40); });
+    assert.equal(threw, null, 'the queued pick was cancelled');
+  });
+});
+
+test('a card is never published for a marker the planet is hiding', async () => {
+  const host = recordingHost();
+  const camera = fakeCamera(NORTH_AMERICA.lon, NORTH_AMERICA.lat, 12_000_000);
+  const viewer = viewerWithSources({ camera });
+  const clicks = clickHandlerFactory();
+  const layer = createEventsLayer({
+    overlayHost: host, screenSpaceEventHandlerFactory: clicks.factory,
+  });
+  const events = [eventAt('far', ASIA)];
+  await withFetch(async () => okResponse(proxyPayload({ events })), async () => {
+    layer.init(viewer);
+    layer.enable(viewer);
+    await layer.update(viewer, {});
+    const [entity] = viewer.sources[0].entities.values;
+    assert.equal(entity.show, false, 'the marker is behind the limb');
+
+    viewer._setPick({ id: entity });
+    clicks.helpers.hover();
+    // Otherwise the card floats in empty space over the near side of the globe.
+    assert.ok(!host.last().some((e) => e.variant === 'card'));
+    layer.destroy(viewer);
+  });
+});
+
+test('hover picking is throttled and pauses while the camera moves', async () => {
+  const camera = fakeCamera(NORTH_AMERICA.lon, NORTH_AMERICA.lat, 12_000_000);
+  const viewer = viewerWithSources({ camera });
+  const clicks = clickHandlerFactory();
+  const layer = createEventsLayer({
+    overlayHost: recordingHost(), screenSpaceEventHandlerFactory: clicks.factory,
+  });
+  let picks = 0;
+  const events = [eventAt('near', NORTH_AMERICA)];
+  await withFetch(async () => okResponse(proxyPayload({ events })), async () => {
+    layer.init(viewer);
+    layer.enable(viewer);
+    await layer.update(viewer, {});
+    viewer.scene.pick = () => { picks += 1; return null; };
+
+    clicks.helpers.hover({ x: 1, y: 1 });
+    const afterFirst = picks;
+    assert.equal(afterFirst, 1, 'the first hover picks');
+    for (let i = 0; i < 20; i += 1) clicks.helpers.hover({ x: i, y: i });
+    assert.equal(picks, afterFirst, 'the throttle suppresses the burst');
+
+    // Picking every frame of a drag is wasted work — the result is discarded
+    // the moment the camera moves again.
+    for (const fn of [...camera.moveStartListeners]) fn();
+    const beforeMoving = picks;
+    for (let i = 0; i < 20; i += 1) clicks.helpers.hover({ x: 200 + i, y: i });
+    assert.equal(picks, beforeMoving, 'no picking while the camera is in motion');
+    layer.destroy(viewer);
+  });
+});
+
+test('the horizon pass runs during movement, not only when it ends', async () => {
+  const camera = fakeCamera(NORTH_AMERICA.lon, NORTH_AMERICA.lat, 12_000_000);
+  const viewer = viewerWithSources({ camera });
+  const layer = createEventsLayer({
+    overlayHost: recordingHost(), screenSpaceEventHandlerFactory: NOOP_HANDLER_FACTORY,
+  });
+  const events = [eventAt('near', NORTH_AMERICA), eventAt('far', ASIA)];
+  await withFetch(async () => okResponse(proxyPayload({ events })), async () => {
+    layer.init(viewer);
+    layer.enable(viewer);
+    await layer.update(viewer, {});
+    const byId = new Map(viewer.sources[0].entities.values.map((e) => [e.id, e]));
+    assert.equal(byId.get('far').show, false);
+
+    // Nothing rides postRender while the camera is parked, so a settled scene
+    // costs exactly zero and the layer keeps taking no continuous-render hold.
+    assert.equal(viewer.scene.postRender.listeners.length, 0, 'parked: no subscription');
+
+    for (const fn of [...camera.moveStartListeners]) fn();
+    assert.equal(viewer.scene.postRender.listeners.length, 1, 'moving: subscribed');
+
+    // Move the camera WITHOUT firing moveEnd — this is the drag/inertia case
+    // the old moveEnd-only pass could not see.
+    camera.positionWC = Cesium.Cartesian3.fromDegrees(ASIA.lon, ASIA.lat, 12_000_000);
+    viewer.scene._renderFrames(1);
+    assert.equal(byId.get('far').show, true, 'far side cleared mid-movement');
+    assert.equal(byId.get('near').show, false);
+
+    for (const fn of [...camera.moveEndListeners]) fn();
+    assert.equal(viewer.scene.postRender.listeners.length, 0, 'settled: unsubscribed');
+    layer.destroy(viewer);
+  });
+});
+
+test('the in-motion pass is throttled and never touches percentageChanged', async () => {
+  const camera = fakeCamera(NORTH_AMERICA.lon, NORTH_AMERICA.lat, 12_000_000);
+  camera.percentageChanged = 0.5;
+  const viewer = viewerWithSources({ camera });
+  const layer = createEventsLayer({
+    overlayHost: recordingHost(), screenSpaceEventHandlerFactory: NOOP_HANDLER_FACTORY,
+  });
+  const events = [eventAt('near', NORTH_AMERICA), eventAt('far', ASIA)];
+  await withFetch(async () => okResponse(proxyPayload({ events })), async () => {
+    layer.init(viewer);
+    layer.enable(viewer);
+    await layer.update(viewer, {});
+    const byId = new Map(viewer.sources[0].entities.values.map((e) => [e.id, e]));
+
+    for (const fn of [...camera.moveStartListeners]) fn();
+    viewer.scene._renderFrames(1);
+    // Move, then drive many frames inside one throttle window: the pass must
+    // not run again, so the stale answer stands until the window expires.
+    camera.positionWC = Cesium.Cartesian3.fromDegrees(ASIA.lon, ASIA.lat, 12_000_000);
+    viewer.scene._renderFrames(30);
+    assert.equal(byId.get('far').show, false, 'throttled out within the window');
+
+    // camera.percentageChanged is a SHARED GLOBAL — traffic.js sets and
+    // restores it, and a second layer mutating it would fight for one value.
+    assert.equal(camera.percentageChanged, 0.5, 'left untouched');
+    layer.destroy(viewer);
+  });
 });
 
 // ── Contract surface ────────────────────────────────────────────────────────

@@ -802,3 +802,53 @@ The 2.0 blog post would restate leg 3 in prose. It is no longer needed.
 | `COL.ACTION_GEO_LAT` = index 56 | **Four independent legs agree** — 1.0 offset (54 + 3), the committed 2.0 list, both §5 mirrors, and the real rows (0/209 plottable at index 55) |
 | Positions 1–39 | **First-party confirmed and test-pinned** — present and identical in the committed 1.0 header, ahead of the first insertion |
 | Positions 40–61 | **First-party confirmed by offset and settled empirically** — the insert relationship is test-pinned, and a shifted map yields 0/209 plottable latitudes |
+
+## 14. CAMEO leaf-code labels: no clean licence found
+
+The hover card would be most informative with a CAMEO **leaf-code verb**
+("Arrest or detain", "Use conventional military force") rather than only the
+category taxonomy. `EventCode` is present on 100% of rows and there are just 36
+distinct values among the plottable fixture rows, so a small label table would
+cover the feed.
+
+**Checked, and not adopted.** The same route used for the schema mirrors in §5:
+
+| Source | Machine-readable code→label table? | Licence |
+| --- | --- | --- |
+| `openeventdata/petrarch2` | **No** — ships `CAMEO.2.0.txt`, a *verb-pattern* dictionary (phrases → codes), not a label map | MIT (repo), but the dictionary is derived from TABARI/CAMEO and WordNet |
+| `openeventdata/Dictionaries` | Contains the codebook source | **No LICENSE file** — all rights reserved |
+| `tenthe/CAMEO-Event-Data-Codebook` | Yes, machine-readable formats | **No LICENSE file** — all rights reserved |
+| `CAMEO.Manual.1.1b3.pdf` (canonical) | Yes, as prose | Hosted on `data.gdeltproject.org`, egress-blocked here; copyright of its authors regardless |
+
+So: the one MIT repository does not contain the table, and the two that do
+contain it carry no licence at all. That is not a clean basis for vendoring a
+label table into an MIT repo, and it is not a case where the "these are facts,
+not expression" argument used for the 61 column names transfers — a ~300-entry
+table of authored English descriptions is a different kind of artifact from a
+list of field names.
+
+**Shipped instead.** The card describes the event through the five-category
+CAMEO taxonomy this repo already derives and phrases in its own words
+(`EVENT_CATEGORIES[].blurb` in `src/data/eventsFeed.js`), plus place, source
+domain, coverage count and a retrospective badge. No third-party label text.
+
+**Also rejected: an actor-pair summary.** The obvious alternative to a verb is
+"Actor1 → Actor2". Measured across the fixture, it does not survive contact
+with the data:
+
+| Field | Filled |
+| --- | --- |
+| `Actor1Name` | 86% |
+| `Actor2Name` | 58% |
+| **both** | **44%** |
+
+And where present the names are frequently generic roles rather than named
+parties — real values include `SCHOOL`, `POLICE`, `IMAM`, `FIREFIGHTER`,
+`NUNAVUT`, often with `Actor1Name` blank, so the line would render as
+"→ SCHOOL". A summary that is absent on a majority of markers and misleading on
+some of the rest is worse than no summary.
+
+**To revisit**, either would do it: a licence appearing on one of the community
+tables, or writing our own short verb labels for the ~20 root codes in our own
+words — which needs the codebook read first, and `www.gdeltproject.org` is
+egress-blocked from this environment.

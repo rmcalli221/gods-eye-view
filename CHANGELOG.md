@@ -5,6 +5,17 @@ of current runtime behavior, see [`docs/CURRENT-STATE.md`](docs/CURRENT-STATE.md
 
 ## [Unreleased] — 2026-08-24
 
+### Added
+
+- Political Events markers now respond to hover: the marker enlarges and a card
+  appears above it with the category and its description, place, source domain,
+  coverage count, and a badge when the event is dated before GDELT ingested it.
+  The card is drawn on the existing world-overlay card lane — no new UI surface.
+- A single click now opens the source article, replacing the previous
+  select-then-click-again interaction. The safeguard that made two stages
+  necessary is kept explicitly: a click that ends a camera drag over a marker
+  opens nothing.
+
 ### Fixed
 
 - Political Events markers no longer render through the globe. Events on the
@@ -12,8 +23,10 @@ of current runtime behavior, see [`docs/CURRENT-STATE.md`](docs/CURRENT-STATE.md
   camera over North America — because the markers are always-on-top
   (`disableDepthTestDistance`, so a marker is never swallowed by the terrain it
   stands on) and nothing else occluded them. They are now horizon-culled
-  against an ellipsoid occluder on camera settle, the same pass the radio,
-  CCTV, flights, and FIRMS layers already run, in both map stacks.
+  against an ellipsoid occluder, the same pass the radio, CCTV, flights, and
+  FIRMS layers already run, in both map stacks. The cull runs during camera
+  movement as well as on settle, so the far side clears while dragging and
+  through zoom inertia rather than only on release.
 
 ### Changed
 
