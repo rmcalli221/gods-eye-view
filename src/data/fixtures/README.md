@@ -108,6 +108,32 @@
   publisher to adopt without notice, and the failure mode if GDELT did would be
   a silently empty file rather than an error.
 
+- `gdelt-gkg-sample.csv` — 10 GKG rows, for `gdeltGkg.test.mjs`.
+
+  **What is observed and what is constructed.** The FORMAT is first-party: a
+  direct field dump of a real GKG file established 27 columns, column 5 the
+  article URL, 8 themes, 12 persons, 14 organizations, 16 tone, and 23
+  quotations with `offset|length||text` prefixes. Two rows carry **real entity
+  values** from that probe — the `george santos` /
+  `commodity futures trading commission; white house; new york times` row, and
+  the comics article whose "organizations" are the fictional
+  `parliament of trees; justice league unlimited`.
+
+  Everything else is **constructed to that observed format**, and the URLs are
+  the real ones from `gdelt-export-sample.tsv` so the join is exercised against
+  genuine keys rather than invented ones. The rows cover: `name,offset`
+  suffixes, organizations with no persons, persons with no organizations, a
+  joined-but-empty row (the ~1.5% with no usable entity), a short row with
+  trailing empties dropped, an entity that merely repeats its event's place, a
+  duplicate URL (first must win), and a URL absent from the export (must not
+  join).
+
+  This is constructed rather than captured because the GKG host is egress-
+  blocked from the environment this was written in — the same reason the ZIP
+  archives above are built rather than captured. Unlike the deleted
+  `gdelt-geo-*.json` fixtures, the format here was **observed before the
+  fixture was written**, not inferred from documentation.
+
 - `gdelt-export-edge.tsv` — hand-built, five rows, **CRLF line endings** and a
   trailing blank line, derived from a real row so the 61-column layout cannot
   drift. Each row exercises one drop rule: a UTF-8 multibyte place name
