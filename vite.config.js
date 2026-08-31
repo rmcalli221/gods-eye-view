@@ -57,6 +57,7 @@ import {
   previousSliceKey,
   sliceKeyFromDateAdded,
 } from './src/data/gdeltExport.js';
+import { gkgUrlForSlice, parseGkgEntities } from './src/data/gdeltGkg.js';
 import { fileURLToPath } from 'node:url';
 import { createRequire } from 'node:module';
 import { defineConfig, loadEnv } from 'vite';
@@ -2126,7 +2127,7 @@ function firmsProxy() {
           const key = mapKey();
           await readDiskOnce();
 
-          if (subPath === '/status') {
+        if (subPath === '/status') {
             if (!key) {
               sendJson(200, { hasKey: false, lastFetch: null, count: null, stale: false, ttlMs: TTL_MS, transactions: null });
               return;
@@ -2211,6 +2212,28 @@ export const GDELT_DEFAULT_MAX_EVENTS = 750;
 export const GDELT_DEFAULT_DAILY_BUDGET = 2000;
 /** GDELT publishes roughly a one-request-per-five-seconds courtesy guidance. */
 export const GDELT_MIN_REQUEST_SPACING_MS = 5_000;
+
+/**
+ * GKG archive caps. SEPARATE FROM THE EXPORT'S ON PURPOSE.
+ *
+ * A GKG slice is 5,336,697 bytes measured — 79x the export's ~67 KB, and well
+ * over `GDELT_MAX_ZIP_BYTES`, so reusing the export's cap would reject every
+ * GKG fetch. The inflated bound is generous because a 5.3 MB TSV archive
+ * expands several-fold, and the whole file is decompressed before the join
+ * discards the ~99% of articles this slice's events never reference.
+ */
+export const GDELT_MAX_GKG_ZIP_BYTES = 32 * 1024 * 1024;
+export const GDELT_MAX_GKG_INFLATED_BYTES = 96 * 1024 * 1024;
+/**
+ * GKG entity enrichment is OFF unless explicitly enabled.
+ *
+ * Fetching a GKG for every slice would cost ~512 MB/day against the export's
+ * 6.5 MB, and the file is flat and unindexed so there is no way to read one
+ * article's row without downloading all of it. Enabled, the fetch is still
+ * lazy per SLICE — triggered by a client asking for that slice's entities,
+ * never by the refresh loop — so a session that hovers nothing costs nothing.
+ */
+export const GDELT_GKG_ENABLED_DEFAULT = false;
 
 /** Local file header signature. */
 const ZIP_LOCAL_SIG = 0x04034b50;
@@ -2382,6 +2405,12 @@ function gdeltEventsProxy() {
     return Number.isFinite(raw) && raw > 0 ? raw : GDELT_DEFAULT_DAILY_BUDGET;
   };
 
+  const gkgEnabled = () => {
+    const raw = String(process.env.GDELT_GKG_ENABLED ?? '').trim().toLowerCase();
+    if (raw === '') return GDELT_GKG_ENABLED_DEFAULT;
+    return raw === '1' || raw === 'true' || raw === 'yes' || raw === 'on';
+  };
+
   const maxEvents = () => {
     const raw = Number.parseInt(process.env.GDELT_EVENTS_MAX_POINTS || '', 10);
     return Number.isFinite(raw) && raw > 0 ? raw : GDELT_DEFAULT_MAX_EVENTS;
@@ -2504,6 +2533,8 @@ function gdeltEventsProxy() {
     // forever. The rows' stamp is kept alongside for the window bounds.
     sliceRing.set(sliceKey, {
       key: sliceKey,
+      /** Lazily joined GKG entities, keyed by article URL. Null until asked for. */
+      entities: null,
       stamp: sliceKeyFromDateAdded(records[0]?.rawDateAdded) || sliceKey,
       fetchedAt: Date.now(),
       records,
@@ -2600,6 +2631,9 @@ function gdeltEventsProxy() {
     const raw = [];
     const funnel = { total: 0, retained: 0 };
     for (const slice of slices) {
+      // Stamp the owning slice so `/api/events/entities` can be asked for the
+      // right GKG without the client re-deriving it from a timestamp.
+      for (const record of slice.records) record.slice = slice.key;
       raw.push(...slice.records);
       funnel.total += slice.total;
       for (const [reason, count] of Object.entries(slice.rejected)) {
@@ -2643,6 +2677,44 @@ function gdeltEventsProxy() {
     return rebuild();
   }
 
+  /**
+   * Fetch and join one slice's GKG entities, once.
+   *
+   * Lazy by design: this runs only when a client asks for a slice's entities,
+   * never from the refresh loop. The join keeps ONLY the URLs this slice's
+   * retained events actually reference — a few hundred of the tens of
+   * thousands the file describes — because holding the rest would put
+   * megabytes per slice in the ring for nothing.
+   *
+   * @param {object} slice Ring entry.
+   * @returns {Promise<Map<string, object>>} Entities by article URL.
+   */
+  async function loadSliceEntities(slice) {
+    if (slice.entities) return slice.entities;
+    const url = gkgUrlForSlice(slice.key, exportBase());
+    if (!url) throw new Error('unusable slice key');
+    const res = await upstreamFetch(url);
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    const declared = Number(res.headers.get('content-length'));
+    if (Number.isFinite(declared) && declared > GDELT_MAX_GKG_ZIP_BYTES) {
+      throw new Error('gkg archive exceeds the size cap');
+    }
+    const archive = Buffer.from(await res.arrayBuffer());
+    if (archive.byteLength > GDELT_MAX_GKG_ZIP_BYTES) {
+      throw new Error('gkg archive exceeds the size cap');
+    }
+    const text = readZipEntry(archive, { maxInflatedBytes: GDELT_MAX_GKG_INFLATED_BYTES })
+      .toString('utf8');
+    const wantedUrls = new Set(slice.records.map((record) => record.url));
+    const { entities, rows, matched } = parseGkgEntities(text, { wantedUrls });
+    slice.entities = entities;
+    console.log(
+      `[gdelt-events-proxy] gkg ${slice.key}: ${matched}/${rows} rows matched `
+      + `${wantedUrls.size} article urls`,
+    );
+    return entities;
+  }
+
   /** Cache entry -> response payload. */
   function buildPayload(entry, stale) {
     return {
@@ -2679,6 +2751,49 @@ function gdeltEventsProxy() {
         await readDiskOnce();
         await loadBudgetOnce();
 
+        // Lazily joined GKG entities for one slice. Deliberately a separate
+        // route rather than inline on /api/events: the enrichment costs 79x the
+        // export per slice, so it must be something a client asks for when a
+        // viewer actually points at a marker, not something every refresh pays.
+        if (subPath === '/entities') {
+          if (!gkgEnabled()) {
+            sendJson(200, { enabled: false, slice: null, entities: {} });
+            return;
+          }
+          const requested = String(new URL(req.url || '', 'http://localhost').searchParams.get('slice') || '');
+          if (!/^\d{14}$/.test(requested)) {
+            sendJson(400, { error: 'bad slice' });
+            return;
+          }
+          const slice = sliceRing.get(requested);
+          if (!slice) {
+            // Aged out of the ring, or never held. Not an error — the client
+            // simply renders without entities.
+            sendJson(404, { error: 'slice not held' });
+            return;
+          }
+          if (!slice.entities && isOverDailyBudget(currentBudget(), dailyBudgetLimit())) {
+            sendJson(429, { error: 'budget' });
+            return;
+          }
+          try {
+            const entities = await loadSliceEntities(slice);
+            const out = {};
+            for (const [url, record] of entities) {
+              // Only what the card renders. Themes and tone stay server-side
+              // until something actually uses them.
+              out[url] = { persons: record.persons, organizations: record.organizations };
+            }
+            sendJson(200, { enabled: true, slice: requested, count: entities.size, entities: out });
+          } catch (err) {
+            console.warn(`[gdelt-events-proxy] gkg ${requested} failed:`, err?.message || err);
+            // Enrichment is strictly additive — a failure must never take the
+            // layer down with it, so this is a soft empty rather than a 5xx.
+            sendJson(200, { enabled: true, slice: requested, count: 0, entities: {} });
+          }
+          return;
+        }
+
         if (subPath === '/status') {
           const state = currentBudget();
           sendJson(200, {
@@ -2692,6 +2807,13 @@ function gdeltEventsProxy() {
             windowFrom: mem ? mem.windowFrom : null,
             windowTo: mem ? mem.windowTo : null,
             gaps: [...sliceGaps].sort(),
+            gkg: {
+              enabled: gkgEnabled(),
+              // Which slices have actually paid the 5.3 MB, so the cost is
+              // visible rather than inferred from traffic.
+              loadedSlices: [...sliceRing.values()]
+                .filter((slice) => slice.entities).map((slice) => slice.key).sort(),
+            },
             budget: { date: state.date, count: state.count, limit: dailyBudgetLimit() },
           });
           return;

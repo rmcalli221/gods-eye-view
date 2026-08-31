@@ -25,6 +25,8 @@ const {
   GDELT_DEFAULT_MAX_EVENTS,
   GDELT_EXPORT_BASE,
   GDELT_MAX_INFLATED_BYTES,
+  GDELT_GKG_ENABLED_DEFAULT,
+  GDELT_MAX_GKG_ZIP_BYTES,
   GDELT_MAX_ZIP_BYTES,
   GDELT_MIN_REQUEST_SPACING_MS,
   GDELT_WINDOW_SLICES,
@@ -35,6 +37,22 @@ const archive = (name) => readFileSync(path.join(FIXTURES, name));
 const SLICE_ZIP = archive('gdelt-export-slice.export.CSV.zip');
 const DATADESC_ZIP = archive('gdelt-export-datadesc.export.CSV.zip');
 const SAMPLE_TSV = readFileSync(path.join(FIXTURES, 'gdelt-export-sample.tsv'), 'utf8');
+
+const GKG_TSV = readFileSync(path.join(FIXTURES, 'gdelt-gkg-sample.csv'), 'utf8');
+/** Zip the GKG fixture in-process; the reader under test is a different one. */
+const GKG_ZIP = (() => {
+  const name = Buffer.from('20260829004500.gkg.csv');
+  const raw = Buffer.from(GKG_TSV, 'utf8');
+  const deflated = deflateRawSync(raw);
+  const local = Buffer.alloc(30 + name.length);
+  local.writeUInt32LE(0x04034b50, 0);
+  local.writeUInt16LE(8, 8);
+  local.writeUInt32LE(deflated.length, 18);
+  local.writeUInt32LE(raw.length, 22);
+  local.writeUInt16LE(name.length, 26);
+  name.copy(local, 30);
+  return Buffer.concat([local, deflated]);
+})();
 
 const NEWEST = '20260829004500';
 // The GKG size is MEASURED: 5,336,697 bytes for the same window whose export is
@@ -148,6 +166,7 @@ test.before(() => {
 });
 
 test.beforeEach(() => {
+  delete process.env.GDELT_GKG_ENABLED;
   delete process.env.GDELT_DAILY_REQUEST_BUDGET;
   delete process.env.GDELT_EVENTS_MAX_POINTS;
   // A one-slice ring by default, so no background backfill runs and each test
@@ -379,6 +398,153 @@ test('slices already held are never refetched', async () => {
     const sliceCalls = urls.filter((url) => url.endsWith('.export.CSV.zip'));
     assert.equal(sliceCalls.length, 2);
     assert.equal(new Set(sliceCalls).size, 2, 'each slice fetched exactly once');
+  });
+});
+
+
+// ── GKG entity enrichment ───────────────────────────────────────────────────
+
+/** Serve lastupdate, the export slice, and that slice's GKG. */
+const sliceWithGkg = (index, url) => {
+  if (url.endsWith('lastupdate.txt')) return textOk(lastUpdateBody());
+  if (url.endsWith(`${NEWEST}.gkg.csv.zip`)) return zipOk(GKG_ZIP);
+  if (url.endsWith(`${NEWEST}.export.CSV.zip`)) return zipOk(SLICE_ZIP);
+  return httpError(404);
+};
+
+test('entity enrichment is off by default and costs nothing unasked', async () => {
+  // 512 MB/day if every slice fetched its GKG, against 6.5 MB for the exports.
+  assert.equal(GDELT_GKG_ENABLED_DEFAULT, false);
+  const { handler } = freshProxy();
+  await withUpstream(sliceWithGkg, async (urls) => {
+    await get(handler);
+    const spent = urls.length;
+    const res = await get(handler, '/entities?slice=' + NEWEST);
+    assert.equal(res.status, 200);
+    assert.deepEqual(res.body, { enabled: false, slice: null, entities: {} });
+    assert.equal(urls.length, spent, 'and no GKG was fetched');
+    assert.ok(!urls.some((u) => u.includes('.gkg.')), 'never even addressed');
+  });
+});
+
+test('enabled, the GKG is fetched only when a slice is actually asked for', async () => {
+  process.env.GDELT_GKG_ENABLED = '1';
+  const { handler } = freshProxy();
+  await withUpstream(sliceWithGkg, async (urls) => {
+    await get(handler);
+    // The refresh loop must not touch the GKG — that is the whole point of
+    // lazy-per-slice over enriching every refresh.
+    assert.ok(!urls.some((u) => u.includes('.gkg.')), 'refresh alone fetches no GKG');
+
+    const res = await get(handler, '/entities?slice=' + NEWEST);
+    assert.equal(res.status, 200);
+    assert.equal(res.body.enabled, true);
+    assert.equal(res.body.slice, NEWEST);
+    assert.ok(res.body.count > 0);
+    assert.equal(urls.filter((u) => u.includes('.gkg.')).length, 1);
+
+    // The join keeps only URLs this slice's events reference.
+    const served = Object.keys(res.body.entities);
+    assert.ok(!served.includes('https://example.org/not-in-the-export'));
+    const sample = res.body.entities[served[0]];
+    assert.ok(Array.isArray(sample.persons) && Array.isArray(sample.organizations));
+    // Themes and tone stay server-side until something uses them.
+    assert.deepEqual(Object.keys(sample).sort(), ['organizations', 'persons']);
+  });
+});
+
+test('a slice pays for its GKG once, however often it is asked for', async () => {
+  process.env.GDELT_GKG_ENABLED = '1';
+  const { handler } = freshProxy();
+  await withUpstream(sliceWithGkg, async (urls) => {
+    await get(handler);
+    await get(handler, '/entities?slice=' + NEWEST);
+    const after = urls.filter((u) => u.includes('.gkg.')).length;
+    await get(handler, '/entities?slice=' + NEWEST);
+    await get(handler, '/entities?slice=' + NEWEST);
+    assert.equal(urls.filter((u) => u.includes('.gkg.')).length, after, 'cached on the slice');
+  });
+});
+
+test('a GKG failure degrades to no entities, never to a broken layer', async () => {
+  process.env.GDELT_GKG_ENABLED = '1';
+  const { handler } = freshProxy();
+  await withUpstream((index, url) => {
+    if (url.endsWith('lastupdate.txt')) return textOk(lastUpdateBody());
+    if (url.endsWith('.gkg.csv.zip')) return httpError(503);
+    if (url.endsWith('.export.CSV.zip')) return zipOk(SLICE_ZIP);
+    return httpError(404);
+  }, async () => {
+    await get(handler);
+    const res = await get(handler, '/entities?slice=' + NEWEST);
+    // Enrichment is strictly additive: a soft empty, not a 5xx that a client
+    // would have to special-case.
+    assert.equal(res.status, 200);
+    assert.deepEqual(res.body.entities, {});
+    assert.equal(res.body.count, 0);
+    assert.ok(!res.raw.includes('503'), 'no upstream status leaks');
+  });
+});
+
+test('an unheld or malformed slice is refused without an upstream call', async () => {
+  process.env.GDELT_GKG_ENABLED = '1';
+  const { handler } = freshProxy();
+  await withUpstream(sliceWithGkg, async (urls) => {
+    await get(handler);
+    const before = urls.length;
+    assert.equal((await get(handler, '/entities?slice=nonsense')).status, 400);
+    assert.equal((await get(handler, '/entities')).status, 400);
+    // A slice that aged out of the ring is a 404, not an error the client
+    // has to recover from.
+    assert.equal((await get(handler, '/entities?slice=20200101000000')).status, 404);
+    assert.equal(urls.length, before, 'none of that touched upstream');
+  });
+});
+
+test('the GKG archive caps are separate from the export ones, and larger', async () => {
+  // A GKG slice is 5,336,697 bytes measured — well over the export's 2 MiB
+  // cap, so sharing it would reject every GKG fetch.
+  assert.ok(GDELT_MAX_GKG_ZIP_BYTES > 5_336_697);
+  assert.ok(GDELT_MAX_GKG_ZIP_BYTES > GDELT_MAX_ZIP_BYTES);
+
+  process.env.GDELT_GKG_ENABLED = '1';
+  const { handler } = freshProxy();
+  await withUpstream((index, url) => {
+    if (url.endsWith('lastupdate.txt')) return textOk(lastUpdateBody());
+    if (url.endsWith('.export.CSV.zip')) return zipOk(SLICE_ZIP);
+    return {
+      ok: true,
+      status: 200,
+      headers: new Headers({ 'content-length': String(GDELT_MAX_GKG_ZIP_BYTES + 1) }),
+      arrayBuffer: async () => { throw new Error('body must not be read'); },
+    };
+  }, async () => {
+    await get(handler);
+    const res = await get(handler, '/entities?slice=' + NEWEST);
+    assert.equal(res.status, 200, 'still additive');
+    assert.deepEqual(res.body.entities, {}, 'oversize refused before inflation');
+  });
+});
+
+test('/status reports whether enrichment is on and which slices have paid', async () => {
+  process.env.GDELT_GKG_ENABLED = '1';
+  const { handler } = freshProxy();
+  await withUpstream(sliceWithGkg, async () => {
+    await get(handler);
+    assert.deepEqual((await get(handler, '/status')).body.gkg,
+      { enabled: true, loadedSlices: [] }, 'nothing paid for yet');
+    await get(handler, '/entities?slice=' + NEWEST);
+    assert.deepEqual((await get(handler, '/status')).body.gkg,
+      { enabled: true, loadedSlices: [NEWEST] }, 'the cost is visible, not inferred');
+  });
+});
+
+test('events carry the slice they came from, so a client can ask for its GKG', async () => {
+  const { handler } = freshProxy();
+  await withUpstream(singleSlice, async () => {
+    const { events } = (await get(handler)).body;
+    assert.ok(events.length > 0);
+    for (const event of events) assert.equal(event.slice, NEWEST);
   });
 });
 

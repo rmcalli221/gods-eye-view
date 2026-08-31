@@ -51,6 +51,24 @@ export const GKG_COL = Object.freeze({
   QUOTATIONS: 22,
 });
 
+/**
+ * Deterministic GKG URL for one slice.
+ *
+ * Same naming family as the export — `{slice}.gkg.csv.zip` beside
+ * `{slice}.export.CSV.zip` — so the slice key the ring already holds addresses
+ * both. Kept here rather than in `gdeltExport.js` so the export parser stays
+ * unaware of the GKG entirely.
+ *
+ * @param {string} slice Slice key, YYYYMMDDHHMMSS.
+ * @param {string} base Upstream base URL.
+ * @returns {?string} Absolute URL, or null for an unusable slice key.
+ */
+export function gkgUrlForSlice(slice, base) {
+  const key = String(slice ?? '').trim();
+  if (!/^\d{14}$/.test(key)) return null;
+  return `${String(base ?? '').replace(/\/*$/, '/')}${key}.gkg.csv.zip`;
+}
+
 /** Longest entity name retained; anything longer is extraction noise. */
 const MAX_ENTITY_CHARS = 60;
 /** Entities kept per kind per article. The card has room for a couple. */
