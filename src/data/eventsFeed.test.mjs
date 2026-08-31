@@ -7,6 +7,7 @@ import { fileURLToPath } from 'node:url';
 import { parseExportTsv } from './gdeltExport.js';
 import {
   EVENT_CATEGORIES,
+  annotateSharedArticles,
   EVENT_CATEGORY_IDS,
   EVENT_DEFAULT_CATEGORY_IDS,
   EVENT_SEVERITY_MODEL,
@@ -224,4 +225,46 @@ test('marker size scales with severity and is bounded', () => {
   assert.equal(eventMarkerPixelSize({ severity: 200 }), 16);
   assert.equal(eventMarkerPixelSize({ severity: -5 }), 6);
   assert.equal(eventMarkerPixelSize({}), 6);
+});
+
+test('markers sharing a source article are annotated with their siblings', () => {
+  // One article routinely places events at several spots — 37% of markers in
+  // the reference slice — and GKG entities are per ARTICLE, so those markers
+  // would otherwise show identical names with nothing explaining why.
+  const records = [
+    { id: '1', url: 'https://x/a', place: 'Seoul, South Korea' },
+    { id: '2', url: 'https://x/a', place: 'Kyiv, Ukraine' },
+    { id: '3', url: 'https://x/a', place: 'Papamoa, Bay of Plenty' },
+    { id: '4', url: 'https://x/b', place: 'Toledo, Ohio' },
+  ];
+  annotateSharedArticles(records);
+  assert.equal(records[0].sharedArticle.count, 3);
+  assert.deepEqual(records[0].sharedArticle.places, ['Kyiv', 'Papamoa']);
+  assert.deepEqual(records[1].sharedArticle.places, ['Seoul', 'Papamoa']);
+  // A record is never listed as its own sibling.
+  for (const record of records.slice(0, 3)) {
+    assert.ok(!record.sharedArticle.places.includes(String(record.place).split(',')[0]));
+  }
+  assert.equal(records[3].sharedArticle, undefined, 'a lone article is not annotated');
+});
+
+test('annotation runs after the cap, so it never names an off-screen sibling', () => {
+  // "Same report as Memphis" is only meaningful if Memphis is actually drawn.
+  const records = [
+    { id: 'a', category: 'conflict', severity: 90, url: 'https://x/a', place: 'Shelby County' },
+    { id: 'b', category: 'conflict', severity: 10, url: 'https://x/a', place: 'Memphis' },
+  ];
+  const both = selectEventsForRender(records, { categories: ['conflict'] });
+  assert.equal(both[0].sharedArticle.count, 2);
+
+  const capped = selectEventsForRender(records, { categories: ['conflict'], maxEntities: 1 });
+  assert.equal(capped.length, 1);
+  assert.equal(capped[0].sharedArticle, undefined, 'the sibling did not survive the budget');
+});
+
+test('annotation tolerates records with no URL', () => {
+  const records = [{ id: '1', place: 'A' }, { id: '2', place: 'B' }];
+  assert.doesNotThrow(() => annotateSharedArticles(records));
+  assert.equal(records[0].sharedArticle, undefined);
+  assert.doesNotThrow(() => annotateSharedArticles(null));
 });

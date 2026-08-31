@@ -20,6 +20,7 @@ import {
   createEventOverlayEntry,
   createEventsLayer,
   createEventHoverCardEntry,
+  entityCardLines,
   eventCullPosition,
   eventHoverCardLines,
   eventLabelText,
@@ -27,6 +28,7 @@ import {
   mapAnalystRecord,
   selectEventOverlayCohort,
   shouldOpenEventSource,
+  titleCaseEntity,
 } from './events.js';
 import { classifyEventRecords } from './eventsFeed.js';
 import { parseExportTsv } from './gdeltExport.js';
@@ -1224,6 +1226,102 @@ test('the in-motion pass is throttled and never touches percentageChanged', asyn
     assert.equal(camera.percentageChanged, 0.5, 'left untouched');
     layer.destroy(viewer);
   });
+});
+
+
+// ── GKG entity card copy ────────────────────────────────────────────────────
+
+test('entities replace the generic category line, which is the whole point', () => {
+  const record = {
+    id: '1', category: 'conflict', place: 'Shelby County, Tennessee, United States',
+    severity: 87, numArticles: 7, domain: 'local3news.com',
+  };
+  const withEntities = eventHoverCardLines(record, {
+    entities: { persons: ['george santos'], organizations: ['commodity futures trading commission'] },
+  });
+  assert.deepEqual(withEntities.details, [
+    'CONFLICT · intensity 87',
+    'George Santos',
+    'Commodity Futures Trading Commission',
+    'local3news.com · 7 reports',
+  ]);
+  // The category description is identical for every conflict event, so it is
+  // dropped when something marker-specific is available.
+  assert.ok(!withEntities.details.includes('Assault, fight, unconventional mass violence'));
+
+  // ...and restored when nothing is.
+  const bare = eventHoverCardLines(record, { entities: null });
+  assert.ok(bare.details.includes('Assault, fight, unconventional mass violence'));
+  assert.deepEqual(eventHoverCardLines(record).details, bare.details, 'entities are optional');
+});
+
+test('a shared source article is named, so identical entities read as intended', () => {
+  const record = {
+    id: '1', category: 'conflict', place: 'Shelby County, Tennessee', severity: 87,
+    domain: 'local3news.com', numArticles: 7,
+  };
+  const two = eventHoverCardLines({ ...record, sharedArticle: { count: 2, places: ['Memphis'] } });
+  assert.ok(two.details.includes('Same report as Memphis'));
+
+  const three = eventHoverCardLines({
+    ...record, sharedArticle: { count: 3, places: ['Rangiuru', 'Paengaroa'] },
+  });
+  assert.ok(three.details.includes('Same report as Rangiuru +1 more'));
+
+  assert.ok(!eventHoverCardLines(record).details.some((d) => d.startsWith('Same report')));
+});
+
+test('entity lines stay whole rather than truncating mid-name', () => {
+  const width = 46;
+  // Two short organizations share a line; two long ones do not.
+  assert.deepEqual(
+    entityCardLines({ organizations: ['european commission', 'nato'] }, 'Brussels'),
+    ['European Commission, NATO'],
+  );
+  assert.deepEqual(
+    entityCardLines({
+      organizations: ['commodity futures trading commission', 'white house'],
+    }, 'Shelby County'),
+    ['Commodity Futures Trading Commission'],
+  );
+  for (const line of entityCardLines({
+    persons: ['a'.repeat(80)], organizations: [],
+  }, 'X')) {
+    assert.ok(line.length <= width, 'a single over-long name is clamped, not dropped');
+  }
+});
+
+test('entities that merely repeat the place are dropped', () => {
+  // The place is already the card title; "London" under "London" is noise.
+  assert.deepEqual(entityCardLines({ organizations: ['london'] }, 'London, City of, United Kingdom'), []);
+  // But a longer name that merely contains the place word is kept.
+  assert.deepEqual(
+    entityCardLines({ organizations: ['london school of economics'] }, 'London, United Kingdom'),
+    ['London School of Economics'],
+  );
+});
+
+test('entity casing handles connectors and known acronyms', () => {
+  assert.equal(titleCaseEntity('parliament of trees'), 'Parliament of Trees');
+  assert.equal(titleCaseEntity('justice league unlimited'), 'Justice League Unlimited');
+  assert.equal(titleCaseEntity('nato'), 'NATO');
+  assert.equal(titleCaseEntity('european commission'), 'European Commission');
+  assert.equal(titleCaseEntity(''), '');
+});
+
+test('a fictional entity is rendered exactly like a real one — a stated limit', () => {
+  // GDELT extracts entities from article text without distinguishing fiction
+  // from reporting. These values are verbatim from a real comics article, and
+  // there is nothing in the export or the GKG that reliably filters them.
+  // See DATA_SOURCES.md; the card must not imply verification.
+  const lines = entityCardLines({
+    persons: ['jeremy adams', 'john ostrander'],
+    organizations: ['parliament of trees', 'justice league unlimited'],
+  }, 'Barcelona, Spain');
+  assert.deepEqual(lines, [
+    'Jeremy Adams, John Ostrander',
+    'Parliament of Trees, Justice League Unlimited',
+  ]);
 });
 
 // ── Contract surface ────────────────────────────────────────────────────────

@@ -452,7 +452,49 @@ export function selectEventsForRender(records, { categories, maxEntities = Infin
   }
   selected.sort((a, b) => b.severity - a.severity || String(a.id).localeCompare(String(b.id)));
   const cap = Number.isFinite(maxEntities) ? Math.max(0, Math.floor(maxEntities)) : Infinity;
-  return cap === Infinity ? selected : selected.slice(0, cap);
+  // Annotate AFTER the cap: a sibling that did not survive the entity budget is
+  // not on screen, so naming it would explain a repetition the viewer cannot see.
+  return annotateSharedArticles(cap === Infinity ? selected : selected.slice(0, cap));
+}
+
+/**
+ * Mark records that share a source article with another RENDERED record.
+ *
+ * One article routinely produces events at several places — 37% of markers in
+ * the reference slice share an article with at least one other, and the groups
+ * span continents (a single Guardian piece placed events in both Seoul and
+ * Kyiv). Because GKG entities are per ARTICLE, every member of such a group
+ * gets identical entity text, so without a signal two markers a hemisphere
+ * apart read the same names and look like a rendering bug.
+ *
+ * Grouping is over the RENDERED set, not the whole window, because the
+ * confusion the annotation answers is specifically "why do these two markers I
+ * can see say the same thing".
+ *
+ * @param {Array<object>} selected Records about to be rendered.
+ * @returns {Array<object>} The same records, with `sharedArticle` where it applies.
+ */
+export function annotateSharedArticles(selected) {
+  const byUrl = new Map();
+  for (const record of Array.isArray(selected) ? selected : []) {
+    const url = String(record?.url || '');
+    if (!url) continue;
+    if (!byUrl.has(url)) byUrl.set(url, []);
+    byUrl.get(url).push(record);
+  }
+  for (const group of byUrl.values()) {
+    if (group.length < 2) continue;
+    for (const record of group) {
+      record.sharedArticle = {
+        count: group.length,
+        places: group
+          .filter((other) => other !== record)
+          .map((other) => String(other.place || '').split(',')[0].trim())
+          .filter(Boolean),
+      };
+    }
+  }
+  return selected;
 }
 
 /**

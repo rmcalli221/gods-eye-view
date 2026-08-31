@@ -238,6 +238,72 @@ export function shouldOpenEventSource(record, { dragged = false } = {}) {
   return Boolean(record.url);
 }
 
+/** Words that stay lowercase inside a name, and ones that are acronyms. */
+const NAME_MINOR = new Set(['of', 'the', 'and', 'for', 'de', 'la', 'van', 'von', 'al', 'du']);
+const NAME_ACRONYMS = new Set(['us', 'uk', 'un', 'eu', 'nato', 'fbi', 'cia', 'nasa', 'who', 'nhs']);
+
+/**
+ * Restore casing on a GKG entity name, which GDELT delivers lowercased.
+ *
+ * Deliberately conservative: it title-cases, keeps a short list of connecting
+ * words lowercase, and upper-cases a short list of acronyms. It will still get
+ * some names wrong (`Mcdonald`, an unlisted acronym) — the alternative is a
+ * name dictionary, which is a bigger dependency than the problem deserves.
+ *
+ * @param {string} value Lowercased entity name.
+ * @returns {string} Display casing.
+ */
+export function titleCaseEntity(value) {
+  return String(value ?? '').split(/\s+/).filter(Boolean).map((word, index) => {
+    const lower = word.toLowerCase();
+    if (NAME_ACRONYMS.has(lower)) return lower.toUpperCase();
+    if (index > 0 && NAME_MINOR.has(lower)) return lower;
+    return lower.charAt(0).toUpperCase() + lower.slice(1);
+  }).join(' ');
+}
+
+/**
+ * Entity lines for the card: persons on one line, organizations on the next.
+ *
+ * Two lines rather than one because organization names are long — a single
+ * "person · org" line truncates mid-word on the card's width more often than
+ * not. Entities that merely repeat the event's own place are dropped: the
+ * place is already the card title, so "London" under "London" is noise.
+ *
+ * @param {?object} entities Parsed GKG record for this event's article.
+ * @param {string} place The event's place, to suppress duplicates of it.
+ * @returns {Array<string>} Zero, one or two lines.
+ */
+export function entityCardLines(entities, place) {
+  const placeWords = new Set(String(place || '').toLowerCase().split(/[\s,]+/).filter(Boolean));
+  const keep = (name) => {
+    const words = String(name).toLowerCase().split(/\s+/);
+    return !(words.length <= 2 && words.every((word) => placeWords.has(word)));
+  };
+  // Greedy fit rather than a fixed count: two short organizations sit on one
+  // line comfortably, two long ones truncate mid-word. Taking the second name
+  // only when it fits keeps every line whole, which matters more than showing
+  // one extra entity.
+  const fit = (names) => {
+    let line = '';
+    for (const name of names) {
+      const next = line ? `${line}, ${name}` : name;
+      if (next.length > CARD_LINE_CHARS) break;
+      line = next;
+    }
+    // A single name longer than the line still gets shown, clamped — dropping
+    // it entirely would lose the only entity the article had.
+    return line || clampCardLine(names[0] || '');
+  };
+
+  const lines = [];
+  const people = (entities?.persons || []).filter(keep).map(titleCaseEntity);
+  const orgs = (entities?.organizations || []).filter(keep).map(titleCaseEntity);
+  if (people.length) lines.push(fit(people));
+  if (orgs.length) lines.push(fit(orgs));
+  return lines;
+}
+
 /** Truncate one card line without breaking mid-escape. */
 function clampCardLine(value) {
   const text = String(value ?? '').replace(/\s+/g, ' ').trim();
@@ -258,14 +324,23 @@ function clampCardLine(value) {
  * A CAMEO leaf-code verb ("Arrest or detain") would be the informative
  * addition, but no cleanly-licensed machine-readable code→label table could be
  * found: the two community tables carry NO license at all, and the one MIT
- * repository ships a verb-pattern dictionary rather than a label map. So the
- * card describes the event through the category taxonomy this repo already
- * owns and phrases itself. See `docs/PHASE1-DECISIONS.md` §14.
+ * repository ships a verb-pattern dictionary rather than a label map. See
+ * `docs/PHASE1-DECISIONS.md` §14.
+ *
+ * WHAT IT SHOWS INSTEAD. When GKG entities are available for the article, the
+ * card names the people and organizations in it — marker-specific, where the
+ * category description is identical for every event in its category. Those
+ * entities are extracted by GDELT from article text and are NOT verified: the
+ * extractor does not distinguish fiction from reporting, so a comics article
+ * yields "Parliament Of Trees, Justice League Unlimited" as organizations.
+ * Without entities the card falls back to the category description.
  *
  * @param {object} record Render record.
+ * @param {object} [options]
+ * @param {?object} [options.entities] Parsed GKG record for this article.
  * @returns {{title: string, details: Array<string>}} Card copy.
  */
-export function eventHoverCardLines(record) {
+export function eventHoverCardLines(record, { entities = null } = {}) {
   const spec = eventCategory(record?.category);
   const details = [];
   const severity = Number(record?.severity);
@@ -273,7 +348,12 @@ export function eventHoverCardLines(record) {
   details.push(clampCardLine(
     Number.isFinite(severity) ? `${label} · intensity ${severity}` : label,
   ));
-  if (spec?.blurb) details.push(clampCardLine(spec.blurb));
+  // Entities REPLACE the category description rather than joining it — naming
+  // them is the whole point, and keeping both would push the card past the
+  // width where its lines stay readable.
+  const entityLines = entityCardLines(entities, record?.place);
+  if (entityLines.length) details.push(...entityLines);
+  else if (spec?.blurb) details.push(clampCardLine(spec.blurb));
 
   const reports = Number(record?.numArticles);
   const domain = String(record?.domain || '').trim();
@@ -282,6 +362,17 @@ export function eventHoverCardLines(record) {
     : '';
   const sourceLine = [domain, coverage].filter(Boolean).join(' · ');
   if (sourceLine) details.push(clampCardLine(sourceLine));
+
+  // One article often places events at several spots, and GKG entities are per
+  // ARTICLE — so those markers carry identical names. Saying so turns a
+  // repetition that reads as a bug into the fact it actually is.
+  const shared = record?.sharedArticle;
+  if (shared && Array.isArray(shared.places) && shared.places.length) {
+    const [first, ...rest] = shared.places;
+    details.push(clampCardLine(rest.length
+      ? `Same report as ${first} +${rest.length} more`
+      : `Same report as ${first}`));
+  }
 
   // A marker for something GDELT coded to a date well before it ingested the
   // row must not read as "happening now".
