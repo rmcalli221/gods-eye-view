@@ -37,10 +37,17 @@ const DATADESC_ZIP = archive('gdelt-export-datadesc.export.CSV.zip');
 const SAMPLE_TSV = readFileSync(path.join(FIXTURES, 'gdelt-export-sample.tsv'), 'utf8');
 
 const NEWEST = '20260829004500';
+// The GKG size is MEASURED: 5,336,697 bytes for the same window whose export is
+// ~67 KB, i.e. 79x larger. An earlier revision of this file carried an invented
+// figure here, and the real one matters because it is the number any "join the
+// GKG for article headlines" proposal has to justify — see docs/ROADMAP.md.
+// The export size matches the ~67 KB measured in docs/PHASE1-DECISIONS.md §6.
+// The mentions size is a placeholder: nothing reads it, and it has never been
+// measured — do not cite it.
 const lastUpdateBody = (slice = NEWEST) => [
   `229194 aaaa ${GDELT_EXPORT_BASE}${slice}.mentions.CSV.zip`,
   `67421 bbbb ${GDELT_EXPORT_BASE}${slice}.export.CSV.zip`,
-  `1180233 cccc ${GDELT_EXPORT_BASE}${slice}.gkg.csv.zip`,
+  `5336697 cccc ${GDELT_EXPORT_BASE}${slice}.gkg.csv.zip`,
 ].join('\n');
 
 /**
